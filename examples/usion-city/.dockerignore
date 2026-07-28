@@ -1,0 +1,8 @@
+node_modules
+test
+scripts
+dev.js
+mode.js
+server.js
+package-lock.json
+*.md

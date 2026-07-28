@@ -1,0 +1,10 @@
+node_modules/
+.DS_Store
+*.log
+
+# Engine build output — rebuilt with `npm run build`.
+/dist/
+
+# The example's artifacts ARE the deploy unit and stay committed:
+#   examples/usion-city/dist/server.mjs
+#   examples/usion-city/client/usion-world.js

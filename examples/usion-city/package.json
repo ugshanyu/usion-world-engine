@@ -1,0 +1,27 @@
+{
+  "name": "@usions/usion-city",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Usion City \u2014 the reference massively-multiplayer world built on the Usion World Engine: a GTA-style city with drivable cars, weapons and Fall Guys hazards, running a rolling race competition.",
+  "type": "module",
+  "main": "server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node dist/server.mjs",
+    "dev": "node dev.js",
+    "build": "node scripts/bundle.mjs",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "jose": "^6.2.3",
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@usions/world-engine": "file:../..",
+    "rollup": "^4.30.1",
+    "vitest": "^2.1.9"
+  },
+  "license": "MIT"
+}

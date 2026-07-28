@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<title>Usion City</title>
+<!--
+  Usion City — the reference client for the Usion World Engine.
+
+  Three scripts and about forty lines of code. The SDK is the platform
+  bridge, Babylon is the renderer, and the world engine is everything else:
+  it generates the city from the seed the server sends, draws it, runs the
+  touch controls, predicts the local player, interpolates everyone else and
+  paints the HUD.
+
+  The engine is served from this origin, so the game is fully self-contained
+  and pins its own engine version — copy `usion-world.js` next to your client
+  and you are done. Only the Usion SDK and Babylon come from the platform.
+-->
+<script src="https://usions.com/usion-sdk.js"></script>
+<script src="https://usions.com/vendor/babylon/9.16.1/babylon.js"></script>
+<script src="/usion-world.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; background: #0a0a0a; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans", sans-serif;
+    -webkit-user-select: none; user-select: none; touch-action: none;
+  }
+  #stage { position: fixed; inset: 0; }
+  #boot {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: #f4f4f5; font-size: 15px; background: #0a0a0a; text-align: center; padding: 24px;
+  }
+  #boot[hidden] { display: none; }
+</style>
+</head>
+<body>
+  <div id="stage"></div>
+  <div id="boot">Loading…</div>
+  <script>
+  (function () {
+    'use strict';
+
+    // Every user-facing string lives here, keyed by the host's language.
+    var STRINGS = {
+      en: {
+        connecting: 'Connecting…', loading: 'Building Usion City…',
+        connectFailed: 'Could not connect', worldFull: 'This world is full',
+        matchTimeout: 'No world available right now', retry: 'Retry',
+        reconnecting: 'Reconnecting…', unsupported: 'This device cannot run 3D worlds',
+        health: 'Health', leaderboard: 'Top players', speed: 'km/h',
+        fire: 'Fire', use: 'Enter', exit: 'Exit', jump: 'Jump', dive: 'Dive', drift: 'Drift',
+        phases: { roam: 'Free roam', countdown: 'Race starts in', racing: 'Race', results: 'Results' },
+        lapOf: 'Lap {n}/{total}', place: 'P{n}',
+        killed: '{killer} knocked out {victim}',
+        youFinished: 'You finished {place}',
+        weapons: { shove: 'Shove', pistol: 'Pistol', smg: 'SMG', shotgun: 'Shotgun', rifle: 'Rifle', rocket: 'Rocket' },
+      },
+      mn: {
+        connecting: 'Холбогдож байна…', loading: 'Юсион хотыг барьж байна…',
+        connectFailed: 'Холбогдож чадсангүй', worldFull: 'Энэ ертөнц дүүрсэн байна',
+        matchTimeout: 'Одоогоор сул ертөнц алга', retry: 'Дахин оролдох',
+        reconnecting: 'Дахин холбогдож байна…', unsupported: 'Энэ төхөөрөмж 3D ертөнц ажиллуулж чадахгүй',
+        health: 'Эрүүл мэнд', leaderboard: 'Тэргүүлэгчид', speed: 'км/ц',
+        fire: 'Буудах', use: 'Суух', exit: 'Буух', jump: 'Үсрэх', dive: 'Шумбах', drift: 'Дрифт',
+        phases: { roam: 'Чөлөөт тоглоом', countdown: 'Уралдаан эхлэхэд', racing: 'Уралдаан', results: 'Дүн' },
+        lapOf: '{n}/{total} тойрог', place: '{n}-р байр',
+        killed: '{killer} {victim}-г унагалаа',
+        youFinished: 'Та {place} эзэллээ',
+        weapons: { shove: 'Түлхэх', pistol: 'Гар буу', smg: 'Автомат', shotgun: 'Хайрцган буу', rifle: 'Винтов', rocket: 'Пуужин' },
+      },
+    };
+
+    function boot(message) {
+      var el = document.getElementById('boot');
+      if (!message) { el.hidden = true; return; }
+      el.hidden = false;
+      el.textContent = message;
+    }
+
+    if (typeof Usion === 'undefined') { boot('The Usion app is required to play.'); return; }
+
+    // Nothing game-related runs before the host hands us its config.
+    Usion.init(function () {
+      var lang = (Usion.getLanguage && Usion.getLanguage()) || 'en';
+      var labels = STRINGS[lang] || STRINGS.en;
+
+      if (typeof BABYLON === 'undefined' || typeof UsionWorld === 'undefined') {
+        boot(labels.unsupported);
+        return;
+      }
+
+      UsionWorld.start({
+        mount: document.getElementById('stage'),
+        labels: labels,
+        locale: lang,
+        canvasLabel: 'Usion City',
+        onWorldReady: function () { boot(null); },
+        onError: function (err) { console.warn('[usion-city]', err); },
+      }).catch(function (err) {
+        boot(String((err && err.message) || err));
+      });
+    });
+  }());
+  </script>
+</body>
+</html>
