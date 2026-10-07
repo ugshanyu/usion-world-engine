@@ -98,14 +98,20 @@ export function createControls(root, options = {}) {
   const btnDive = makeButton('dive', labels.dive || 'Dive', labels.diveAria || 'Dive');
   const btnBrake = makeButton('handbrake', labels.drift || 'Drift', labels.driftAria || 'Handbrake drift');
   btnBrake.hidden = true;
+  // A game shows only the buttons it uses (`buttons: ['jump', 'dive']`).
+  const enabled = new Set(options.buttons || ['fire', 'use', 'jump', 'dive', 'handbrake']);
+  const allowed = (name) => enabled.has(name);
+  for (const [name, btn] of [['fire', btnFire], ['use', btnUse], ['jump', btnJump], ['dive', btnDive]]) {
+    if (!allowed(name)) btn.hidden = true;
+  }
 
   /** Swap the button set when the player gets in or out of a car. */
   function setDriving(on) {
     if (driving === on) return;
     driving = on;
-    btnJump.hidden = on;
-    btnDive.hidden = on;
-    btnBrake.hidden = !on;
+    btnJump.hidden = on || !allowed('jump');
+    btnDive.hidden = on || !allowed('dive');
+    btnBrake.hidden = !on || !allowed('handbrake');
     btnUse.textContent = on ? (labels.exit || 'Exit') : (labels.use || 'Enter');
     btnUse.setAttribute('aria-label', on ? (labels.exitAria || 'Leave vehicle') : (labels.useAria || 'Enter vehicle'));
     input.jump = false;
@@ -196,7 +202,7 @@ export function createControls(root, options = {}) {
   }
   window.addEventListener('keydown', onKey(true));
   window.addEventListener('keyup', onKey(false));
-  root.addEventListener('mousedown', (ev) => { if (ev.button === 0 && !ev.target.closest('.uw-btn')) input.fire = true; });
+  root.addEventListener('mousedown', (ev) => { if (allowed('fire') && ev.button === 0 && !ev.target.closest('.uw-btn')) input.fire = true; });
   window.addEventListener('mouseup', () => { input.fire = false; });
 
   /** Fold keyboard state into the stick vector and derive driving inputs. */

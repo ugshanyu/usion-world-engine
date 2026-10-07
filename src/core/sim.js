@@ -66,7 +66,10 @@ export function createSimulation(options) {
   const playerList = [];
   const vehicleList = [];
   const traceCtx = { collision: world.collision, players: playerList, vehicles: vehicleList, ignoreVehicle: null };
-  const charCtx = { collision: world.collision, movers: world.movers, physics: world.physics, moverById: world.moverById };
+  const charCtx = {
+    collision: world.collision, movers: world.movers, physics: world.physics,
+    moverById: world.moverById, config: world.character,
+  };
   const rollers = world.physics ? createRollers(world) : null;
   const pushMove = world.physics ? (p, dx, dz) => world.physics.moveCharacter(p, dx, 0, dz) : null;
 
@@ -185,6 +188,8 @@ export function createSimulation(options) {
    * Move a player somewhere new (start grids, round resets): out of any
    * vehicle, at rest, with every movement timer cleared. Bumps `teleports`
    * so the owner's prediction snaps instead of smoothing across the jump.
+   * `spot.locked` (optional) also sets whether the player can move — a
+   * locked player still falls and gets knocked, but ignores input.
    */
   function teleportPlayer(p, spot) {
     leaveVehicle(p, true);
@@ -195,6 +200,7 @@ export function createSimulation(options) {
     p.grounded = true;
     p.rideId = null;
     p.teleports = (p.teleports || 0) + 1;
+    if (spot.locked !== undefined) p.locked = !!spot.locked;
   }
 
   function damagePlayer(p, amount, sourceId, cause) {
@@ -704,6 +710,7 @@ export function createSimulation(options) {
       x: p.x, y: p.y, z: p.z, vx: p.vx, vy: p.vy, vz: p.vz, yaw: p.yaw,
       g: p.grounded ? 1 : 0, co: p.coyote, jb: p.jumpBuffer,
       dv: p.diveT, dc: p.diveCd, st: p.stunT, gu: p.getUpT, rd: p.rideId || null,
+      lk: p.locked ? 1 : 0,
     };
   }
 

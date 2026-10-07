@@ -17,7 +17,9 @@
  *     platform — same motion, but riders are carried (smooth easing)
  *     crusher  — vertical piston (travel defaults to straight down)
  *     conveyor — static box with a surface velocity  (speed along local +Z)
- *   Optional: `push` (extra knockback multiplier), `damage` (per hit).
+ *   Optional: `push` (extra knockback multiplier), `damage` (per hit),
+ *   `rideable` (override: e.g. a piston with `rideable: false` is a pusher
+ *   that knocks you over instead of carrying you), `color` (renderer).
  */
 import { TAU } from './math.js';
 import { prepareSolid, refreshSolid, depenetrateSphere, solidTopAt } from './collision.js';
@@ -49,7 +51,7 @@ export function createMover(spec) {
     speed: spec.speed ?? 6,
     push: spec.push ?? 1,
     damage: spec.damage ?? 0,
-    rideable: RIDEABLE.has(kind),
+    rideable: spec.rideable ?? RIDEABLE.has(kind),
     // Current kinematics, refreshed by update():
     vx: 0, vy: 0, vz: 0, omega: 0,
   };

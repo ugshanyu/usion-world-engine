@@ -121,7 +121,7 @@ export function createPhysics(R, manifest, movers, opts = {}) {
   // ---- rollers (server-only dynamic balls) --------------------------------
   const rollers = new Map();      // id → {id, body, collider, r}
   const rollerByCollider = new Map();
-  function addRoller(id, x, y, z, r, vx = 0, vy = 0, vz = 0) {
+  function addRoller(id, x, y, z, r, vx = 0, vy = 0, vz = 0, push = 0.6) {
     const body = world.createRigidBody(R.RigidBodyDesc.dynamic()
       .setTranslation(x, y, z).setLinvel(vx, vy, vz).setCcdEnabled(true));
     const collider = world.createCollider(R.ColliderDesc.ball(r).setDensity(2).setRestitution(0.2)
@@ -129,7 +129,7 @@ export function createPhysics(R, manifest, movers, opts = {}) {
       // player capsules accept no contacts, so balls never bounce off people.
       .setFriction(0.8).setCollisionGroups(groups(GROUP.ROLLER,
         GROUP.STATIC | GROUP.RIDE | GROUP.HAZARD | GROUP.ROLLER | GROUP.PLAYER)), body);
-    const roller = { id, body, collider, r };
+    const roller = { id, body, collider, r, push };     // push: share of its speed a hit transfers
     rollers.set(id, roller);
     rollerByCollider.set(collider.handle, roller);
     return roller;
@@ -206,13 +206,14 @@ export function createPhysics(R, manifest, movers, opts = {}) {
 
   /** What is directly under a player's feet: {normalY, mover} or null. */
   const ray = new R.Ray({ x: 0, y: 0, z: 0 }, { x: 0, y: -1, z: 0 });
-  const groundResult = { normalY: 1, mover: null };
+  const groundResult = { normalY: 1, mover: null, gap: 0 };
   function groundUnder(p, reach = 0.35) {
     ray.origin.x = p.x; ray.origin.y = p.y + 0.15; ray.origin.z = p.z;
     const hit = world.castRayAndGetNormal(ray, 0.15 + reach, true, undefined, GROUND_GROUPS);
     if (!hit) return null;
     groundResult.normalY = hit.normal.y;
     groundResult.mover = moverByCollider.get(hit.collider.handle) || null;
+    groundResult.gap = hit.timeOfImpact - 0.15;        // feet → surface (≈ the controller's skin)
     return groundResult;
   }
 

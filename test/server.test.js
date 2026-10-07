@@ -179,7 +179,12 @@ describe('world server (direct mode)', () => {
     const before = client.frames.filter(f => f.type === 'state_snapshot').pop().payload.seq;
     client.send('ping', { t: 1, last_sequence: 0 });        // force a resync keyframe
     const resync = await client.wait(f => f.type === 'state_snapshot' && f.payload.keyframe && f.payload.seq >= before);
-    expect(resync.payload.seq).toBe(before);                // reuses the counter, never advances it
+    // The keyframe reuses the counter of the last broadcast before it, never
+    // advances it (a broadcast may legitimately land between ping and reply).
+    const at = client.frames.indexOf(resync);
+    const lastBroadcast = client.frames.slice(0, at)
+      .filter(f => f.type === 'state_snapshot' && !f.payload.keyframe).pop();
+    expect(resync.payload.seq).toBe(lastBroadcast.payload.seq);
 
     const seqs = client.frames
       .filter(f => f.type === 'state_snapshot' && !f.payload.keyframe)

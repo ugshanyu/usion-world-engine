@@ -9,6 +9,9 @@
  *     life   — seconds before a ball is removed (default 12)
  *     max    — cap on live balls from this spawner (default 6)
  *     v*     — launch velocity
+ *     push   — share of the ball's speed a hit transfers to a player (default 0.6)
+ *     despawn — optional box {minX, maxX, minZ, maxZ}: a ball leaving it is
+ *               removed (e.g. at the foot of a ramp)
  *
  * Spawning is a pure function of world time, so a restarted room produces
  * the same balls at the same moments.
@@ -38,7 +41,7 @@ export function createRollers(world) {
       if (sp.live.length >= sp.max) continue;
       const s = sp.spec;
       const id = s.id + '_' + index;
-      physics.addRoller(id, s.x, s.y ?? 0, s.z, sp.radius, s.vx || 0, s.vy || 0, s.vz || 0);
+      physics.addRoller(id, s.x, s.y ?? 0, s.z, sp.radius, s.vx || 0, s.vy || 0, s.vz || 0, s.push ?? 0.6);
       sp.live.push({ id, until: t + sp.life });
       sim.emit({ e: 'roll', id, x: q(s.x), y: q(s.z) });
     }
@@ -51,8 +54,12 @@ export function createRollers(world) {
       for (let i = sp.live.length - 1; i >= 0; i--) {
         const ball = sp.live[i];
         const roller = physics.rollers.get(ball.id);
-        const y = roller ? roller.body.translation().y : -Infinity;
-        if (t < ball.until && y > killY) continue;
+        const pos = roller ? roller.body.translation() : null;
+        const d = sp.spec.despawn;
+        const outside = d && pos && (pos.x < (d.minX ?? -Infinity) || pos.x > (d.maxX ?? Infinity)
+          || pos.z < (d.minZ ?? -Infinity) || pos.z > (d.maxZ ?? Infinity));
+        if (pos && t < ball.until && pos.y > killY && !outside) continue;
+        if (outside) sim.emit({ e: 'pop', id: ball.id, x: q(pos.x), y: q(pos.z), h: q(pos.y) });
         physics.removeRoller(ball.id);
         sp.live.splice(i, 1);
       }

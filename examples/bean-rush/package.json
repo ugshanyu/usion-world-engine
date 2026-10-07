@@ -1,0 +1,23 @@
+{
+  "name": "@usions/bean-rush",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Bean Rush — an 8-player party obstacle race on the Usion World Engine (Rapier physics, server-authoritative, bots fill empty seats).",
+  "type": "module",
+  "main": "server.js",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "dev": "node dev.js",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@dimforge/rapier3d-deterministic-compat": "0.21.0",
+    "jose": "^6.2.3",
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@usions/world-engine": "file:../..",
+    "vitest": "^2.1.9"
+  },
+  "license": "MIT"
+}

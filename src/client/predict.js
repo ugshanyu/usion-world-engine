@@ -31,7 +31,10 @@ const MAX_HISTORY = 90;        // 3 s of inputs at 30 Hz
  */
 export function createPredictor(world, opts = {}) {
   const dt = opts.dt ?? 1 / 30;
-  const ctx = { collision: world.collision, movers: world.movers, physics: world.physics, moverById: world.moverById };
+  const ctx = {
+    collision: world.collision, movers: world.movers, physics: world.physics,
+    moverById: world.moverById, config: world.character,
+  };
   const me = { id: '__me__' };
   spawnCharacter(me, { x: 0, y: 0, z: 0, yaw: 0 });
   me.hp = 100;
@@ -173,6 +176,7 @@ export function createPredictor(world, opts = {}) {
     me.diveT = s.dv; me.diveCd = s.dc;
     me.stunT = s.st; me.getUpT = s.gu;
     me.rideId = s.rd || null;
+    me.locked = !!s.lk;
   }
 
   function dropApplied(ack) {

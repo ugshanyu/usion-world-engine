@@ -74,7 +74,7 @@ export async function start(options = {}) {
   mount.appendChild(canvas);
 
   const hud = createHud(mount, { labels, locale });
-  const controls = createControls(mount, { labels });
+  const controls = createControls(mount, { labels, buttons: options.buttons });
   hud.overlay(labels.connecting, labels.loading);
 
   let renderer = null;
@@ -185,11 +185,20 @@ export async function start(options = {}) {
   // ---- input -------------------------------------------------------------
   // One input per fixed tick, numbered, sent and predicted in the same step —
   // the server applies them one per tick in the same order (see predict.js).
+  // The stick is camera-relative (up = away from the camera); the simulation
+  // wants world directions. Characters face the camera when the game aims
+  // with it (shooters) or the way they run (`faceCamera: false`).
+  const faceCamera = options.faceCamera !== false;
   function sampleInput() {
     const input = controls.sample();
+    const yaw = input.aim || 0;
+    const c = Math.cos(yaw);
+    const sn = Math.sin(yaw);
+    const wx = input.mx * c + input.mz * sn;
+    const wz = -input.mx * sn + input.mz * c;
     return {
-      mx: round2(input.mx), mz: round2(input.mz),
-      aim: round2(input.aim),
+      mx: round2(wx), mz: round2(wz),
+      aim: faceCamera ? round2(input.aim) : undefined,
       jump: input.jump, sprint: input.sprint, dive: input.dive,
       throttle: round2(input.throttle), steer: round2(input.steer),
       handbrake: input.handbrake,

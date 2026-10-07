@@ -778,7 +778,9 @@ function createCollisionWorld(options = {}) {
  *     platform — same motion, but riders are carried (smooth easing)
  *     crusher  — vertical piston (travel defaults to straight down)
  *     conveyor — static box with a surface velocity  (speed along local +Z)
- *   Optional: `push` (extra knockback multiplier), `damage` (per hit).
+ *   Optional: `push` (extra knockback multiplier), `damage` (per hit),
+ *   `rideable` (override: e.g. a piston with `rideable: false` is a pusher
+ *   that knocks you over instead of carrying you), `color` (renderer).
  */
 
 const RIDEABLE = new Set(['platform', 'piston', 'crusher', 'conveyor']);
@@ -808,7 +810,7 @@ function createMover(spec) {
     speed: spec.speed ?? 6,
     push: spec.push ?? 1,
     damage: spec.damage ?? 0,
-    rideable: RIDEABLE.has(kind),
+    rideable: spec.rideable ?? RIDEABLE.has(kind),
     // Current kinematics, refreshed by update():
     vx: 0, vy: 0, vz: 0, omega: 0,
   };
@@ -1049,7 +1051,7 @@ function createPhysics(R, manifest, movers, opts = {}) {
   // ---- rollers (server-only dynamic balls) --------------------------------
   const rollers = new Map();      // id → {id, body, collider, r}
   const rollerByCollider = new Map();
-  function addRoller(id, x, y, z, r, vx = 0, vy = 0, vz = 0) {
+  function addRoller(id, x, y, z, r, vx = 0, vy = 0, vz = 0, push = 0.6) {
     const body = world.createRigidBody(R.RigidBodyDesc.dynamic()
       .setTranslation(x, y, z).setLinvel(vx, vy, vz).setCcdEnabled(true));
     const collider = world.createCollider(R.ColliderDesc.ball(r).setDensity(2).setRestitution(0.2)
@@ -1057,7 +1059,7 @@ function createPhysics(R, manifest, movers, opts = {}) {
       // player capsules accept no contacts, so balls never bounce off people.
       .setFriction(0.8).setCollisionGroups(groups(GROUP.ROLLER,
         GROUP.STATIC | GROUP.RIDE | GROUP.HAZARD | GROUP.ROLLER | GROUP.PLAYER)), body);
-    const roller = { id, body, collider, r };
+    const roller = { id, body, collider, r, push };     // push: share of its speed a hit transfers
     rollers.set(id, roller);
     rollerByCollider.set(collider.handle, roller);
     return roller;
@@ -1134,13 +1136,14 @@ function createPhysics(R, manifest, movers, opts = {}) {
 
   /** What is directly under a player's feet: {normalY, mover} or null. */
   const ray = new R.Ray({ x: 0, y: 0, z: 0 }, { x: 0, y: -1, z: 0 });
-  const groundResult = { normalY: 1, mover: null };
+  const groundResult = { normalY: 1, mover: null, gap: 0 };
   function groundUnder(p, reach = 0.35) {
     ray.origin.x = p.x; ray.origin.y = p.y + 0.15; ray.origin.z = p.z;
     const hit = world.castRayAndGetNormal(ray, 0.15 + reach, true, undefined, GROUND_GROUPS);
     if (!hit) return null;
     groundResult.normalY = hit.normal.y;
     groundResult.mover = moverByCollider.get(hit.collider.handle) || null;
+    groundResult.gap = hit.timeOfImpact - 0.15;        // feet → surface (≈ the controller's skin)
     return groundResult;
   }
 
@@ -1207,6 +1210,7 @@ const surface = { vx: 0, vy: 0, vz: 0 };
 function stepCharacterPhysics(p, input, dt, ctx) {
   const C = ctx.config || CHARACTER;
   const phys = ctx.physics;
+  if (p.locked) input = null;          // countdowns, spectating: physics only, no control
 
   const ctl = beginCharacterStep(p, input, dt);
 
@@ -1274,9 +1278,12 @@ function stepCharacterPhysics(p, input, dt, ctx) {
   }
 
   // ---- ground -------------------------------------------------------------
+  // Grounded = our own short ray finds walkable ground right under the feet.
+  // (The controller's own flag flickers off for single ticks while running
+  // on flat ground, which breaks coyote time and the run animation.)
   const rising = p.vy > 0.001 && p.stunT === knockedBefore;
   const ground = rising ? null : phys.groundUnder(p);
-  p.grounded = !rising && res.grounded && !!ground && ground.normalY >= C.maxSlopeNormalY;
+  p.grounded = !rising && !!ground && ground.gap < 0.12 && ground.normalY >= C.maxSlopeNormalY;
   p.rideId = p.grounded && ground.mover && ground.mover.rideable ? ground.mover.id : null;
   if (p.grounded) {
     if (p.vy < 0) p.vy = 0;
@@ -1355,6 +1362,7 @@ function spawnCharacter(p, spawn) {
   p.getUpT = 0;
   p.anim = 'idle';
   p.rideId = null;
+  p.locked = false;
   p.veh = null;
   p.seat = -1;
   return p;
@@ -1383,6 +1391,7 @@ function applyImpulse(p, ix, iy, iz, stun = 0) {
 function stepCharacter(p, input, dt, ctx) {
   if (ctx.physics) return stepCharacterPhysics(p, input, dt, ctx);
   const C = ctx.config || CHARACTER;
+  if (p.locked) input = null;          // countdowns, spectating: physics only, no control
   const collision = ctx.collision;
   const movers = ctx.movers || [];
 
@@ -1717,6 +1726,8 @@ function normalizeManifest(manifest) {
     zones: manifest.zones || [],
     meshes: manifest.meshes || [],      // [{vertices:[x,y,z,…], indices:[…]}] — Rapier backend only
     rollers: manifest.rollers || [],    // ball spawners — Rapier backend only
+    game: manifest.game || {},          // the game's own data (bot routes, podiums…), carried untouched
+    character: manifest.character || null,  // per-world movement tuning (e.g. one run speed)
   };
   if (!m.spawns.length) throw new Error('world manifest needs at least one spawn point');
   m.movers.forEach((mv, i) => { if (!mv.id) mv.id = 'mv' + i; });
@@ -1745,8 +1756,11 @@ function buildWorld(manifest, options = {}) {
   const movers = m.movers.map(createMover);
   updateMovers(movers, 0);
   const moverById = new Map(movers.map(mv => [mv.id, mv]));
+  // Movement tuning lives in the manifest so the server and every phone's
+  // prediction read the same numbers.
+  const character = m.character ? { ...CHARACTER, ...m.character } : CHARACTER;
   const physics = options.rapier
-    ? createPhysics(options.rapier, m, movers, { character: CHARACTER, dt: options.dt, gravity: manifest.gravity })
+    ? createPhysics(options.rapier, m, movers, { character, dt: options.dt, gravity: manifest.gravity })
     : null;
   const checkpoints = m.checkpoints.slice().sort((a, b) => a.order - b.order);
 
@@ -1756,6 +1770,7 @@ function buildWorld(manifest, options = {}) {
     movers,
     moverById,
     physics,
+    character,
     checkpoints,
     zones: m.zones,
     spawns: m.spawns,
@@ -1860,6 +1875,9 @@ function createRng(seed = 1) {
  *     life   — seconds before a ball is removed (default 12)
  *     max    — cap on live balls from this spawner (default 6)
  *     v*     — launch velocity
+ *     push   — share of the ball's speed a hit transfers to a player (default 0.6)
+ *     despawn — optional box {minX, maxX, minZ, maxZ}: a ball leaving it is
+ *               removed (e.g. at the foot of a ramp)
  *
  * Spawning is a pure function of world time, so a restarted room produces
  * the same balls at the same moments.
@@ -1888,7 +1906,7 @@ function createRollers(world) {
       if (sp.live.length >= sp.max) continue;
       const s = sp.spec;
       const id = s.id + '_' + index;
-      physics.addRoller(id, s.x, s.y ?? 0, s.z, sp.radius, s.vx || 0, s.vy || 0, s.vz || 0);
+      physics.addRoller(id, s.x, s.y ?? 0, s.z, sp.radius, s.vx || 0, s.vy || 0, s.vz || 0, s.push ?? 0.6);
       sp.live.push({ id, until: t + sp.life });
       sim.emit({ e: 'roll', id, x: q(s.x), y: q(s.z) });
     }
@@ -1901,8 +1919,12 @@ function createRollers(world) {
       for (let i = sp.live.length - 1; i >= 0; i--) {
         const ball = sp.live[i];
         const roller = physics.rollers.get(ball.id);
-        const y = roller ? roller.body.translation().y : -Infinity;
-        if (t < ball.until && y > killY) continue;
+        const pos = roller ? roller.body.translation() : null;
+        const d = sp.spec.despawn;
+        const outside = d && pos && (pos.x < (d.minX ?? -Infinity) || pos.x > (d.maxX ?? Infinity)
+          || pos.z < (d.minZ ?? -Infinity) || pos.z > (d.maxZ ?? Infinity));
+        if (pos && t < ball.until && pos.y > killY && !outside) continue;
+        if (outside) sim.emit({ e: 'pop', id: ball.id, x: q(pos.x), y: q(pos.z), h: q(pos.y) });
         physics.removeRoller(ball.id);
         sp.live.splice(i, 1);
       }
@@ -2560,7 +2582,10 @@ function createSimulation(options) {
   const playerList = [];
   const vehicleList = [];
   const traceCtx = { collision: world.collision, players: playerList, vehicles: vehicleList, ignoreVehicle: null };
-  const charCtx = { collision: world.collision, movers: world.movers, physics: world.physics, moverById: world.moverById };
+  const charCtx = {
+    collision: world.collision, movers: world.movers, physics: world.physics,
+    moverById: world.moverById, config: world.character,
+  };
   const rollers = world.physics ? createRollers(world) : null;
   const pushMove = world.physics ? (p, dx, dz) => world.physics.moveCharacter(p, dx, 0, dz) : null;
 
@@ -2679,6 +2704,8 @@ function createSimulation(options) {
    * Move a player somewhere new (start grids, round resets): out of any
    * vehicle, at rest, with every movement timer cleared. Bumps `teleports`
    * so the owner's prediction snaps instead of smoothing across the jump.
+   * `spot.locked` (optional) also sets whether the player can move — a
+   * locked player still falls and gets knocked, but ignores input.
    */
   function teleportPlayer(p, spot) {
     leaveVehicle(p, true);
@@ -2689,6 +2716,7 @@ function createSimulation(options) {
     p.grounded = true;
     p.rideId = null;
     p.teleports = (p.teleports || 0) + 1;
+    if (spot.locked !== undefined) p.locked = !!spot.locked;
   }
 
   function damagePlayer(p, amount, sourceId, cause) {
@@ -3198,6 +3226,7 @@ function createSimulation(options) {
       x: p.x, y: p.y, z: p.z, vx: p.vx, vy: p.vy, vz: p.vz, yaw: p.yaw,
       g: p.grounded ? 1 : 0, co: p.coyote, jb: p.jumpBuffer,
       dv: p.diveT, dc: p.diveCd, st: p.stunT, gu: p.getUpT, rd: p.rideId || null,
+      lk: p.locked ? 1 : 0,
     };
   }
 

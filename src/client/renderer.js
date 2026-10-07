@@ -101,16 +101,19 @@ export function createRenderer(canvas, manifest, options = {}) {
   }
 
   // ---- static world -------------------------------------------------------
+  // A world with no ground (`groundY: null`, e.g. an obstacle course in the
+  // sky) gets a sea far below instead: falling should look like falling.
+  const voidWorld = manifest.groundY === null;
   const ground = BABYLON.MeshBuilder.CreateGround('ground', {
     width: (manifest.bounds.maxX - manifest.bounds.minX) + 400,
     height: (manifest.bounds.maxZ - manifest.bounds.minZ) + 400,
   }, scene);
   ground.position.set(
     (manifest.bounds.maxX + manifest.bounds.minX) / 2,
-    manifest.groundY ?? 0,
+    voidWorld ? (manifest.killY ?? -25) + 4 : (manifest.groundY ?? 0),
     (manifest.bounds.maxZ + manifest.bounds.minZ) / 2,
   );
-  ground.material = material(theme.ground);
+  ground.material = material(voidWorld ? theme.water : theme.ground, voidWorld ? { emissive: true } : {});
   ground.freezeWorldMatrix();
 
   buildStatics();
@@ -149,9 +152,42 @@ export function createRenderer(canvas, manifest, options = {}) {
       merged.alwaysSelectAsActiveMesh = false;
     }
 
+    // Mesh geometry (e.g. exported from Blender): one Babylon mesh each.
+    for (const m of manifest.meshes || []) {
+      const mesh = new BABYLON.Mesh('mesh', scene);
+      const data = new BABYLON.VertexData();
+      data.positions = m.vertices;
+      data.indices = m.indices;
+      const normals = [];
+      BABYLON.VertexData.ComputeNormals(m.vertices, m.indices, normals);
+      data.normals = normals;
+      data.applyToMesh(mesh);
+      mesh.material = material(m.color || theme.buildings[0]);
+      mesh.material.backFaceCulling = false;
+      mesh.isPickable = false;
+      mesh.freezeWorldMatrix();
+    }
+
     // Props are decoration only — the server does not know they exist.
+    // Shape props (`box` / `sphere` / `cylinder` with a colour) are merged per
+    // colour like solids, so a course full of candy costs a few draw calls.
     const props = [];
+    const shapesByColor = new Map();
     for (const prop of manifest.props || []) {
+      if (prop.kind === 'box' || prop.kind === 'sphere' || prop.kind === 'cylinder') {
+        const mesh = prop.kind === 'box'
+          ? BABYLON.MeshBuilder.CreateBox('pb', { width: prop.w || 1, height: prop.h || 1, depth: prop.d || 1 }, scene)
+          : prop.kind === 'sphere'
+            ? BABYLON.MeshBuilder.CreateSphere('ps', { diameter: prop.d || 1, segments: 10 }, scene)
+            : BABYLON.MeshBuilder.CreateCylinder('pc', { height: prop.h || 1, diameter: prop.d || 0.3, tessellation: 12 }, scene);
+        mesh.position.set(prop.x, prop.y || 0, prop.z);
+        mesh.rotation.set(prop.rx || 0, prop.ry || 0, prop.rz || 0);
+        const hex = prop.color || theme.accent;
+        let bucket = shapesByColor.get(hex);
+        if (!bucket) shapesByColor.set(hex, (bucket = []));
+        bucket.push(mesh);
+        continue;
+      }
       let mesh;
       if (prop.kind === 'tree') {
         mesh = BABYLON.MeshBuilder.CreateCylinder('p', { height: 5, diameterTop: 3.4, diameterBottom: 0.5, tessellation: 6 }, scene);
@@ -162,6 +198,15 @@ export function createRenderer(canvas, manifest, options = {}) {
       }
       mesh.rotation.y = prop.ry || 0;
       props.push({ mesh, kind: prop.kind });
+    }
+    for (const [hex, meshes] of shapesByColor) {
+      const merged = meshes.length > 1
+        ? BABYLON.Mesh.MergeMeshes(meshes, true, true, undefined, false, false)
+        : meshes[0];
+      if (!merged) continue;
+      merged.material = material(hex);
+      merged.isPickable = false;
+      merged.freezeWorldMatrix();
     }
     const trees = props.filter(p => p.kind === 'tree').map(p => p.mesh);
     const lamps = props.filter(p => p.kind !== 'tree').map(p => p.mesh);
@@ -183,7 +228,7 @@ export function createRenderer(canvas, manifest, options = {}) {
     const mesh = BABYLON.MeshBuilder.CreateBox('mv', {
       width: spec.w || 1, height: spec.h || 1, depth: spec.d || 1,
     }, scene);
-    mesh.material = material(spec.kind === 'platform' || spec.kind === 'conveyor' ? '#6d7a8c' : theme.accent, { emissive: true });
+    mesh.material = material(spec.color || (spec.kind === 'platform' || spec.kind === 'conveyor' ? '#6d7a8c' : theme.accent), { emissive: true });
     mesh.isPickable = false;
     moverMeshes.set(spec.id, mesh);
   }
@@ -204,8 +249,29 @@ export function createRenderer(canvas, manifest, options = {}) {
   }
 
   // ---- entity pools -------------------------------------------------------
+  // Avatars: the default humanoid, or `avatar: 'bean'` — a round jelly-bean
+  // body with big eyes (party games). Both expose root + tinted parts.
+  const bean = options.avatar === 'bean';
   const playerPool = createPool(() => {
     const root = new BABYLON.TransformNode('pl', scene);
+    if (bean) {
+      const body = BABYLON.MeshBuilder.CreateCapsule('b', { height: 1.8, radius: 0.55, tessellation: 14, subdivisions: 4 }, scene);
+      body.position.y = 0.9;
+      body.parent = root;
+      const eyes = [];
+      for (const side of [-1, 1]) {
+        const eye = BABYLON.MeshBuilder.CreateSphere('e', { diameter: 0.34, segments: 8 }, scene);
+        eye.position.set(side * 0.2, 1.38, 0.43);
+        eye.parent = root;
+        const pupil = BABYLON.MeshBuilder.CreateSphere('pu', { diameter: 0.16, segments: 6 }, scene);
+        pupil.position.set(side * 0.2, 1.38, 0.59);
+        pupil.parent = root;
+        eye.material = material('#ffffff', { emissive: true });
+        pupil.material = material('#1c1f24');
+        eyes.push(eye, pupil);
+      }
+      return { root, body, head: null, nose: null, eyes };
+    }
     const body = BABYLON.MeshBuilder.CreateCapsule('b', { height: 1.7, radius: 0.4 }, scene);
     body.position.y = 0.85;
     body.parent = root;
@@ -216,6 +282,11 @@ export function createRenderer(canvas, manifest, options = {}) {
     nose.position.set(0, 1.6, 0.3);
     nose.parent = root;
     return { root, body, head, nose };
+  });
+
+  const rollerPool = createPool(() => {
+    const mesh = BABYLON.MeshBuilder.CreateSphere('ro', { diameter: 2, segments: 14 }, scene);
+    return { root: mesh };
   });
 
   const vehiclePool = createPool(() => {
@@ -273,7 +344,7 @@ export function createRenderer(canvas, manifest, options = {}) {
     item.root.setEnabled(on);
   }
 
-  const teamColors = ['#ff5a3c', '#3ca0ff', '#3cd18a', '#ffd166', '#c084fc', '#f472b6'];
+  const teamColors = options.playerColors || ['#ff5a3c', '#3ca0ff', '#3cd18a', '#ffd166', '#c084fc', '#f472b6'];
   function colorForId(id) {
     let h = 0;
     for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
@@ -289,6 +360,7 @@ export function createRenderer(canvas, manifest, options = {}) {
     vehiclePool.begin();
     bulletPool.begin();
     pickupPool.begin();
+    rollerPool.begin();
 
     const camX = camera.position.x;
     const camZ = camera.position.z;
@@ -312,8 +384,8 @@ export function createRenderer(canvas, manifest, options = {}) {
         const tint = dead ? '#555a60' : (e.tm ? teamColors[e.tm.charCodeAt(0) % teamColors.length] : colorForId(e.id));
         const mat = material(tint);
         item.body.material = mat;
-        item.head.material = mat;
-        item.nose.material = material('#1c1f24');
+        if (item.head) item.head.material = mat;
+        if (item.nose) item.nose.material = material('#1c1f24');
         item.root.rotation.x = e.s === 'dive' || e.s === 'stun' ? 1.15 : 0;
         item.root.position.y = e.wy + (e.s === 'dive' || e.s === 'stun' ? 0.35 : 0);
       } else if (e.k === 'v') {
@@ -333,6 +405,15 @@ export function createRenderer(canvas, manifest, options = {}) {
           wheel.rotation.x = spin;
           wheel.material = material('#191b1f');
         }
+      } else if (e.k === 'o') {
+        // Rolling ball (server physics): spin it by how far it has travelled.
+        const item = rollerPool.take();
+        const r = e.r || 1;
+        item.root.position.set(e.wx, e.wy, e.wz);
+        item.root.scaling.setAll(r);
+        item.root.rotation.x = (e.wz || 0) / r;
+        item.root.rotation.z = -(e.wx || 0) / r;
+        item.root.material = material(options.rollerColor || theme.accent);
       } else if (e.k === 'b') {
         const item = bulletPool.take();
         item.root.position.set(e.wx, e.wy, e.wz);
@@ -351,6 +432,7 @@ export function createRenderer(canvas, manifest, options = {}) {
     vehiclePool.end();
     bulletPool.end();
     pickupPool.end();
+    rollerPool.end();
 
     // Hazards: recomputed from world time, never received over the network.
     if (view.movers) {

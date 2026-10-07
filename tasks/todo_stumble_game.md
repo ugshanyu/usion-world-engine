@@ -52,14 +52,24 @@ move, jump, dive.
 - Also fixed (universe plan Phase 1): mode `config` was never applied, seat
   numbering, shooting your own vehicle, race/elimination teleports while seated
 
-### M2 — The level, playable alone with bots
-- [ ] Course built from engine pieces: start platform, spinning-bar field,
-      hammer bridge, pusher wall, gap jumps over a drop, rolling-ball slope,
-      final climb, finish arch; 3–4 checkpoints
-- [ ] Target length ~60–90 s for a good run
-- [ ] Bots that follow the course with mistakes (some fall, some get hit)
-- [ ] Camera: third-person follow, never clips into obstacles
-- [ ] Local play in the devkit/browser, desktop + touch
+### M2 — The level, playable alone with bots ✅ (`examples/bean-rush`)
+- [x] Candy course: start pad, railed spinner field, three gap jumps, hammer
+      bridge, pusher deck, moving platforms, walled ball ramp (two alternating
+      lanes), finish; 4 checkpoints + finish line
+- [x] Length: bots finish in ~50–100 s; the 5-of-8 quota fills before the
+      150 s limit (tested over a full simulated race)
+- [x] Bots with skill-based mistakes: route following, timed gap jumps,
+      platform timing (aim where it will be on landing), bar hopping, ball dodging
+- [x] Rules: countdown lock (predicted on the phone too), respawn at the last
+      checkpoint, qualify, results, next round, late joiners wait, empty rooms park
+- [x] Camera: third-person follow (props kept clear of its path)
+- [x] Local play in the browser: dev harness on :3050, keyboard + touch
+      (only Jump/Dive shown), en + mn strings, countdown + results overlays
+- [x] Engine additions: per-world character tuning (one run speed — phones have
+      no sprint), camera-relative stick (was world-fixed: a real bug), locked
+      players, hazard pistons, ball despawn lines + push, game data in manifests,
+      configurable touch buttons, renderer meshes/props/rollers/sea/bean avatar
+- Not yet: real-phone feel test, bean animations (M4), sound (M4)
 
 ### M3 — Online match
 - [ ] Match flow: join → waiting (fill with bots after a short wait) →

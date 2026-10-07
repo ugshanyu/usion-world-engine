@@ -59,6 +59,7 @@ export function spawnCharacter(p, spawn) {
   p.getUpT = 0;
   p.anim = 'idle';
   p.rideId = null;
+  p.locked = false;
   p.veh = null;
   p.seat = -1;
   return p;
@@ -87,6 +88,7 @@ export function applyImpulse(p, ix, iy, iz, stun = 0) {
 export function stepCharacter(p, input, dt, ctx) {
   if (ctx.physics) return stepCharacterPhysics(p, input, dt, ctx);
   const C = ctx.config || CHARACTER;
+  if (p.locked) input = null;          // countdowns, spectating: physics only, no control
   const collision = ctx.collision;
   const movers = ctx.movers || [];
 

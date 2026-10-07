@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<title>Bean Rush</title>
+<!--
+  Bean Rush — an 8-player party obstacle race on the Usion World Engine.
+  The SDK is the platform bridge, Babylon draws, the engine does everything
+  else (course, Rapier physics, prediction, controls, HUD). This page adds the
+  strings, the big countdown and the results card.
+-->
+<script src="https://usions.com/usion-sdk.js"></script>
+<script src="https://usions.com/vendor/babylon/9.16.1/babylon.js"></script>
+<script src="/usion-world.js"></script>
+<style>
+  :root { --ink: #2b1d3a; --card: rgba(255, 255, 255, 0.94); --berry: #ff4f8b; --mint: #2fcf9b; --muted: #6b5a7a; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; background: #bfe9ff; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans", sans-serif;
+    -webkit-user-select: none; user-select: none; touch-action: none; color: var(--ink);
+  }
+  #stage { position: fixed; inset: 0; }
+  #boot {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    font-size: 17px; font-weight: 600; background: #bfe9ff; text-align: center; padding: 24px;
+  }
+  #boot[hidden] { display: none; }
+
+  /* Bean Rush has no health, weapons, speed or score: keep only the objective line. */
+  .uw-bar, .uw-weapon, .uw-speed, .uw-map, .uw-card:has(.uw-boardtitle) { display: none !important; }
+
+  #big {
+    position: fixed; left: 0; right: 0; top: 30%; text-align: center; pointer-events: none;
+    font-size: clamp(56px, 18vw, 120px); font-weight: 900; color: #fff;
+    -webkit-text-stroke: 3px var(--ink); paint-order: stroke fill;
+    transform: scale(1); transition: transform 0.15s ease-out, opacity 0.3s;
+  }
+  #big[hidden] { display: none; }
+  #big.pop { transform: scale(1.25); }
+
+  #results {
+    position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    width: min(92vw, 380px); max-height: 80vh; overflow: auto;
+    background: var(--card); border-radius: 20px; padding: 18px 18px 12px;
+    box-shadow: 0 10px 40px rgba(43, 29, 58, 0.25);
+  }
+  #results[hidden] { display: none; }
+  #results h2 { font-size: 20px; text-align: center; margin-bottom: 4px; }
+  #results p.next { text-align: center; color: var(--muted); font-size: 14px; margin-bottom: 10px; }
+  #results ol { list-style: none; }
+  #results li {
+    display: flex; align-items: center; gap: 10px; padding: 9px 6px; min-height: 44px;
+    border-top: 1px solid rgba(43, 29, 58, 0.08); font-size: 16px;
+  }
+  #results li.me { background: rgba(255, 79, 139, 0.1); border-radius: 10px; }
+  #results .pl { width: 28px; font-weight: 800; text-align: center; }
+  #results .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #results .tag { font-size: 13px; font-weight: 700; padding: 3px 8px; border-radius: 999px; white-space: nowrap; }
+  #results .tag.q { background: var(--mint); color: #fff; }
+  #results .tag.out { background: #ece6f2; color: var(--muted); }
+  @media (prefers-reduced-motion: reduce) { #big { transition: none; } #big.pop { transform: none; } }
+</style>
+</head>
+<body>
+  <div id="stage"></div>
+  <div id="big" hidden aria-live="assertive"></div>
+  <section id="results" hidden aria-live="polite">
+    <h2 id="results-title"></h2>
+    <p class="next" id="results-next"></p>
+    <ol id="results-list"></ol>
+  </section>
+  <div id="boot">Loading…</div>
+  <script>
+  (function () {
+    'use strict';
+
+    // Every user-facing string lives here, keyed by the host's language.
+    var STRINGS = {
+      en: {
+        connecting: 'Connecting…', loading: 'Getting the course ready…',
+        connectFailed: 'Could not connect', worldFull: 'This race is full',
+        matchTimeout: 'No race available right now', retry: 'Retry',
+        reconnecting: 'Reconnecting…', unsupported: 'This device cannot run 3D games',
+        jump: 'Jump', dive: 'Dive', jumpAria: 'Jump', diveAria: 'Dive forward',
+        phases: { waiting: 'Get ready', countdown: 'Starting', racing: 'Race to the finish!', results: 'Results' },
+        qualified: 'Qualified {n}/{quota}',
+        place: '#{n}',
+        youQualified: 'You qualified!',
+        youFinished: 'You finished {place}',
+        go: 'GO!',
+        resultsTitle: 'Round {n} results',
+        nextRound: 'Next round in {s}s',
+        qualifiedTag: 'Qualified', outTag: 'Out',
+        you: '{name} (you)',
+        canvas: 'Bean Rush race course',
+      },
+      mn: {
+        connecting: 'Холбогдож байна…', loading: 'Замыг бэлдэж байна…',
+        connectFailed: 'Холбогдож чадсангүй', worldFull: 'Энэ уралдаан дүүрсэн байна',
+        matchTimeout: 'Одоогоор уралдаан алга', retry: 'Дахин оролдох',
+        reconnecting: 'Дахин холбогдож байна…', unsupported: 'Энэ төхөөрөмж 3D тоглоом ажиллуулж чадахгүй',
+        jump: 'Үсрэх', dive: 'Шумбах', jumpAria: 'Үсрэх', diveAria: 'Урагш шумбах',
+        phases: { waiting: 'Бэлэн бай', countdown: 'Эхлэхэд', racing: 'Барианд хүр!', results: 'Дүн' },
+        qualified: 'Шалгарсан {n}/{quota}',
+        place: '{n}-р',
+        youQualified: 'Та шалгарлаа!',
+        youFinished: 'Та {place} байрт орлоо',
+        go: 'ЯВ!',
+        resultsTitle: '{n}-р тойргийн дүн',
+        nextRound: 'Дараагийн тойрог {s} секундэд',
+        qualifiedTag: 'Шалгарсан', outTag: 'Хасагдсан',
+        you: '{name} (та)',
+        canvas: 'Bean Rush уралдааны зам',
+      },
+    };
+
+    function format(t, v) { return String(t).replace(/\{(\w+)\}/g, function (_, k) { return v[k] != null ? v[k] : ''; }); }
+
+    function boot(message) {
+      var el = document.getElementById('boot');
+      if (!message) { el.hidden = true; return; }
+      el.hidden = false;
+      el.textContent = message;
+    }
+
+    if (typeof Usion === 'undefined') { boot('The Usion app is required to play.'); return; }
+
+    Usion.init(function () {
+      var lang = (Usion.getLanguage && Usion.getLanguage()) || 'en';
+      var labels = STRINGS[lang] || STRINGS.en;
+      document.documentElement.lang = STRINGS[lang] ? lang : 'en';
+
+      if (typeof BABYLON === 'undefined' || typeof UsionWorld === 'undefined') { boot(labels.unsupported); return; }
+
+      var big = document.getElementById('big');
+      var results = document.getElementById('results');
+      var lastBig = '';
+      function showBig(text) {
+        if (text === lastBig) return;
+        lastBig = text;
+        big.hidden = !text;
+        big.textContent = text || '';
+        if (text) { big.classList.add('pop'); setTimeout(function () { big.classList.remove('pop'); }, 150); }
+      }
+      var goUntil = 0;
+      var shownRound = -1;
+
+      function renderResults(m, meId) {
+        if (shownRound === m.round) return;
+        shownRound = m.round;
+        document.getElementById('results-title').textContent = format(labels.resultsTitle, { n: m.round });
+        var list = document.getElementById('results-list');
+        list.textContent = '';
+        (m.standings || []).forEach(function (s) {
+          var li = document.createElement('li');
+          if (s.id === meId) li.className = 'me';
+          var pl = document.createElement('span'); pl.className = 'pl'; pl.textContent = s.pl ? s.pl : '–';
+          var nm = document.createElement('span'); nm.className = 'nm';
+          nm.textContent = s.id === meId ? format(labels.you, { name: s.n }) : s.n;
+          var tag = document.createElement('span'); tag.className = 'tag ' + (s.q ? 'q' : 'out');
+          tag.textContent = s.q ? labels.qualifiedTag : labels.outTag;
+          li.appendChild(pl); li.appendChild(nm); li.appendChild(tag);
+          list.appendChild(li);
+        });
+      }
+
+      var game = null;
+      UsionWorld.start({
+        mount: document.getElementById('stage'),
+        labels: labels,
+        locale: lang,
+        canvasLabel: labels.canvas,
+        buttons: ['jump', 'dive'],
+        faceCamera: false,                 // beans face where they run
+        rapierUrl: '/rapier.mjs',
+        render: {
+          avatar: 'bean',
+          playerColors: ['#ff4f8b', '#7a5cff', '#2fcf9b', '#ff8a3d', '#3aa7ff', '#ffc531', '#e05cff', '#24c6d1'],
+          rollerColor: '#ff4f8b',
+          fogDensity: 0.0012,
+        },
+        onWorldReady: function () { boot(null); },
+        onEvent: function (ev) {
+          if (ev.e === 'go') goUntil = performance.now() + 900;
+        },
+        onFrame: function () {
+          if (!game) return;
+          var g = game.net.global;
+          var m = g && g.m;
+          if (!m) return;
+          if (m.phase === 'countdown') showBig(String(Math.max(1, m.left)));
+          else if (performance.now() < goUntil) showBig(labels.go);
+          else showBig('');
+          if (m.phase === 'results') {
+            renderResults(m, game.net.meId);
+            document.getElementById('results-next').textContent = format(labels.nextRound, { s: m.left });
+            results.hidden = false;
+          } else {
+            results.hidden = true;
+          }
+        },
+        onError: function (err) { console.warn('[bean-rush]', err); },
+      }).then(function (g) { game = g; }).catch(function (err) {
+        boot(String((err && err.message) || err));
+      });
+    });
+  }());
+  </script>
+</body>
+</html>

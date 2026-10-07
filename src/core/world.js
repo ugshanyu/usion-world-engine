@@ -50,6 +50,8 @@ export function normalizeManifest(manifest) {
     zones: manifest.zones || [],
     meshes: manifest.meshes || [],      // [{vertices:[x,y,z,…], indices:[…]}] — Rapier backend only
     rollers: manifest.rollers || [],    // ball spawners — Rapier backend only
+    game: manifest.game || {},          // the game's own data (bot routes, podiums…), carried untouched
+    character: manifest.character || null,  // per-world movement tuning (e.g. one run speed)
   };
   if (!m.spawns.length) throw new Error('world manifest needs at least one spawn point');
   m.movers.forEach((mv, i) => { if (!mv.id) mv.id = 'mv' + i; });
@@ -78,8 +80,11 @@ export function buildWorld(manifest, options = {}) {
   const movers = m.movers.map(createMover);
   updateMovers(movers, 0);
   const moverById = new Map(movers.map(mv => [mv.id, mv]));
+  // Movement tuning lives in the manifest so the server and every phone's
+  // prediction read the same numbers.
+  const character = m.character ? { ...CHARACTER, ...m.character } : CHARACTER;
   const physics = options.rapier
-    ? createPhysics(options.rapier, m, movers, { character: CHARACTER, dt: options.dt, gravity: manifest.gravity })
+    ? createPhysics(options.rapier, m, movers, { character, dt: options.dt, gravity: manifest.gravity })
     : null;
   const checkpoints = m.checkpoints.slice().sort((a, b) => a.order - b.order);
 
@@ -89,6 +94,7 @@ export function buildWorld(manifest, options = {}) {
     movers,
     moverById,
     physics,
+    character,
     checkpoints,
     zones: m.zones,
     spawns: m.spawns,

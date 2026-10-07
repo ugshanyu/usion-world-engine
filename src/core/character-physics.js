@@ -27,6 +27,7 @@ const surface = { vx: 0, vy: 0, vz: 0 };
 export function stepCharacterPhysics(p, input, dt, ctx) {
   const C = ctx.config || CHARACTER;
   const phys = ctx.physics;
+  if (p.locked) input = null;          // countdowns, spectating: physics only, no control
 
   const ctl = beginCharacterStep(p, input, dt, C);
 
@@ -94,9 +95,12 @@ export function stepCharacterPhysics(p, input, dt, ctx) {
   }
 
   // ---- ground -------------------------------------------------------------
+  // Grounded = our own short ray finds walkable ground right under the feet.
+  // (The controller's own flag flickers off for single ticks while running
+  // on flat ground, which breaks coyote time and the run animation.)
   const rising = p.vy > 0.001 && p.stunT === knockedBefore;
   const ground = rising ? null : phys.groundUnder(p);
-  p.grounded = !rising && res.grounded && !!ground && ground.normalY >= C.maxSlopeNormalY;
+  p.grounded = !rising && !!ground && ground.gap < 0.12 && ground.normalY >= C.maxSlopeNormalY;
   p.rideId = p.grounded && ground.mover && ground.mover.rideable ? ground.mover.id : null;
   if (p.grounded) {
     if (p.vy < 0) p.vy = 0;
