@@ -17,6 +17,9 @@ import { createInterestGrid } from '../core/interest.js';
 import { sendFrame } from './net.js';
 
 const KEYFRAME_MIN_INTERVAL_MS = 1000;
+const MAX_CATCH_UP_STEPS = 5;          // after a stall, run at most this many ticks at once
+const DEFAULT_GRACE_MS = 15_000;       // matches the platform's reconnect grace
+const DEFAULT_MAX_ENTITIES = 96;       // per-observer cap: the nearest N are sent
 
 export class WorldRoom {
   /**
@@ -30,6 +33,9 @@ export class WorldRoom {
    * @param {number} [opts.snapshotHz=15]
    * @param {number} [opts.aoiRadius=140]
    * @param {number} [opts.maxPlayers=200]
+   * @param {object} [opts.rapier]      initialised RAPIER → Rapier physics backend
+   * @param {number} [opts.graceMs=15000] how long a dropped player keeps their place
+   * @param {number} [opts.maxEntities=96] per-observer entity cap
    */
   constructor(opts) {
     this.roomId = opts.roomId;
@@ -39,7 +45,10 @@ export class WorldRoom {
     this.snapshotHz = opts.snapshotHz ?? 15;
     this.aoiRadius = opts.aoiRadius ?? 140;
     this.maxPlayers = opts.maxPlayers ?? 200;
-    this.world = buildWorld(opts.manifest);
+    this.graceMs = opts.graceMs ?? DEFAULT_GRACE_MS;
+    this.maxEntities = opts.maxEntities ?? DEFAULT_MAX_ENTITIES;
+    this._dt = 1 / this.tickHz;
+    this.world = buildWorld(opts.manifest, { rapier: opts.rapier, dt: this._dt });
     this.sim = createSimulation({
       world: this.world,
       mode: opts.mode,
@@ -56,14 +65,15 @@ export class WorldRoom {
     this._pendingRemoved = new Set();
     this._tickCount = 0;
     this._lastTickAt = Date.now();
+    this._acc = 0;
     this._ticksPerSnapshot = Math.max(1, Math.round(this.tickHz / this.snapshotHz));
-    this._maxDt = 0.25;
     const tickMs = Math.round(1000 / this.tickHz);
     this._tickTimer = setInterval(() => this._tick(), tickMs);
     this._tickTimer.unref?.();
   }
 
   get playerIds() { return Array.from(this.players.keys()); }
+  /** Everyone holding a place, including players inside their reconnect grace. */
   get playerCount() { return this.players.size; }
 
   /** Admit (or re-attach) an authenticated player. */
@@ -79,8 +89,12 @@ export class WorldRoom {
       }
       existing.ws = ws;
       existing.sessionId = sessionId;
+      existing.disconnectedAt = 0;
+      existing.sent = new Map();             // the keyframe below resets their view
     } else {
-      this.players.set(userId, { id: userId, name, sessionId, ws, lastKeyframeAt: 0 });
+      this.players.set(userId, {
+        id: userId, name, sessionId, ws, lastKeyframeAt: 0, disconnectedAt: 0, sent: new Map(),
+      });
       const p = this.sim.addPlayer(userId, name);
       this.grid.upsert(userId, p.x, p.z);
     }
@@ -103,6 +117,7 @@ export class WorldRoom {
       mode: this.sim.mode ? { id: this.sim.mode.id, name: this.sim.mode.name } : null,
       sim_hz: this.tickHz,
       snapshot_hz: this.snapshotHz,
+      physics: this.world.physics ? 'rapier' : 'arcade',
       aoi_radius: this.aoiRadius,
     });
     sendFrame(ws, 'state_snapshot', this._buildKeyframe(userId));
@@ -117,11 +132,29 @@ export class WorldRoom {
     return { ok: true, reconnect: !!existing };
   }
 
+  /**
+   * A socket dropped. Keep the player's place (and body, standing still) for
+   * `graceMs` so a phone blinking between networks lands back in the same
+   * spot with the same progress; remove only if they never come back.
+   */
+  disconnectPlayer(userId, expectedWs) {
+    const player = this.players.get(userId);
+    if (!player) return false;
+    if (expectedWs && player.ws !== expectedWs) return false;
+    if (this.graceMs <= 0) return this.removePlayer(userId, expectedWs, 'disconnected');
+    player.ws = null;
+    player.disconnectedAt = Date.now();
+    this.sim.clearInput(userId);
+    this.log('info', 'player disconnected (grace)', { room: this.roomId, user: userId, grace_ms: this.graceMs });
+    return true;
+  }
+
   removePlayer(userId, expectedWs, reason) {
     const player = this.players.get(userId);
     if (!player) return false;
     if (expectedWs && player.ws !== expectedWs) return false;
     this.players.delete(userId);
+    for (const other of this.players.values()) other.sent.delete(userId);
     this.sim.removePlayer(userId);
     this.grid.remove(userId);
     this.grid.dropObserver(userId);
@@ -163,19 +196,41 @@ export class WorldRoom {
       try { player.ws?.close(code, reason); } catch { /* gone */ }
     }
     this.players.clear();
+    this.world.dispose();
   }
 
   // ── internals ──────────────────────────────────────────────────────────
 
+  /**
+   * Fixed-step loop. Timers fire late and unevenly, so real time accumulates
+   * and the simulation always advances in exact 1/tickHz steps — the same
+   * steps a phone replays when it predicts. After a long stall we catch up a
+   * few ticks and drop the rest rather than spiralling.
+   */
   _tick() {
     const now = Date.now();
-    const dt = Math.min(this._maxDt, Math.max(0, (now - this._lastTickAt) / 1000) || (1 / this.tickHz));
+    this._acc += Math.max(0, now - this._lastTickAt) / 1000;
     this._lastTickAt = now;
+    let steps = 0;
+    let snapshotDue = false;
+    while (this._acc >= this._dt && steps < MAX_CATCH_UP_STEPS) {
+      this.sim.step(this._dt);
+      this._acc -= this._dt;
+      steps += 1;
+      this._tickCount += 1;
+      if (this._tickCount % this._ticksPerSnapshot === 0) snapshotDue = true;
+    }
+    if (steps === MAX_CATCH_UP_STEPS && this._acc >= this._dt) this._acc = 0;
+    if (snapshotDue) this._snapshotPhase(now);
+    this._sweepGrace(now);
+  }
 
-    this.sim.step(dt);
-
-    this._tickCount += 1;
-    if (this._tickCount % this._ticksPerSnapshot === 0) this._snapshotPhase(now);
+  _sweepGrace(now) {
+    for (const player of this.players.values()) {
+      if (player.disconnectedAt && now - player.disconnectedAt > this.graceMs) {
+        this.removePlayer(player.id, null, 'timeout');
+      }
+    }
   }
 
   _snapshotPhase(now) {
@@ -201,16 +256,25 @@ export class WorldRoom {
     for (const player of this.players.values()) {
       if (!player.ws || player.ws.readyState !== 1) continue;
       const self = this.sim.getPlayer(player.id);
-      const slice = { world: global };
+      let visibleIds = [];
       let removed = removedIds ? removedIds.slice() : [];
       if (self) {
         const { left, visible } = this.grid.observe(player.id, self.x, self.z, this.aoiRadius);
-        for (const id of visible) {
-          const e = entities[id];
-          if (e) slice[id] = e;
-        }
-        slice[player.id] = entities[player.id];
+        visibleIds = this._nearest(visible, entities, self, player.id);
         if (left.length) removed = [...new Set([...removed, ...left])];
+      }
+      // Only what changed since this player last heard about it.
+      const slice = { world: global };
+      const seen = new Set();
+      for (const id of visibleIds) {
+        seen.add(id);
+        const diff = diffEntity(player.sent.get(id), entities[id]);
+        if (diff) slice[id] = diff;
+        player.sent.set(id, entities[id]);
+      }
+      // Entities that fell out of the capped set count as removed for them.
+      for (const id of player.sent.keys()) {
+        if (!seen.has(id)) { player.sent.delete(id); if (!removed.includes(id)) removed.push(id); }
       }
       sendFrame(player.ws, 'state_snapshot', {
         seq: this.seq,
@@ -220,6 +284,7 @@ export class WorldRoom {
         events: [],
         you: player.id,
         ack: self ? self.lastSeq : 0,
+        me: self ? this.sim.projectSelf(player.id) : null,
       });
       if (events.length) {
         const mine = events.filter(ev => this._eventVisible(ev, self));
@@ -229,6 +294,19 @@ export class WorldRoom {
         }
       }
     }
+  }
+
+  /** The observer itself plus the nearest visible entities, capped at maxEntities. */
+  _nearest(visible, entities, self, selfId) {
+    const ids = [];
+    for (const id of visible) if (entities[id] && id !== selfId) ids.push(id);
+    if (ids.length > this.maxEntities - 1) {
+      const d = (id) => { const e = entities[id]; const dx = e.x - self.x; const dz = e.y - self.z; return dx * dx + dz * dz; };
+      ids.sort((a, b) => d(a) - d(b));
+      ids.length = this.maxEntities - 1;
+    }
+    if (entities[selfId]) ids.push(selfId);
+    return ids;
   }
 
   /** Events with a position are area-of-interest filtered like entities. */
@@ -244,12 +322,15 @@ export class WorldRoom {
   _buildKeyframe(userId) {
     const entities = this.sim.projectEntities();
     const self = this.sim.getPlayer(userId);
+    const player = this.players.get(userId);
     const slice = { world: this.sim.projectGlobal() };
+    if (player) player.sent = new Map();
     if (self) {
-      for (const id of this.grid.query(self.x, self.z, this.aoiRadius)) {
-        if (entities[id]) slice[id] = entities[id];
+      const ids = this._nearest(this.grid.query(self.x, self.z, this.aoiRadius), entities, self, userId);
+      for (const id of ids) {
+        slice[id] = entities[id];
+        if (player) player.sent.set(id, entities[id]);
       }
-      if (entities[userId]) slice[userId] = entities[userId];
     }
     return {
       seq: this.seq,
@@ -259,11 +340,13 @@ export class WorldRoom {
       events: [],
       you: userId,
       ack: self ? self.lastSeq : 0,
+      me: self ? this.sim.projectSelf(userId) : null,
       keyframe: true,
     };
   }
 
   _broadcast(type, payload) {
+    // (players inside their reconnect grace have no socket; sendFrame skips them)
     for (const player of this.players.values()) sendFrame(player.ws, type, payload);
   }
 
@@ -272,4 +355,21 @@ export class WorldRoom {
       if (player.id !== excludeId) sendFrame(player.ws, type, payload);
     }
   }
+}
+
+/**
+ * Fields of `next` that differ from `prev` (entities are flat objects of
+ * primitives). A new entity is sent whole; an unchanged one not at all.
+ */
+export function diffEntity(prev, next) {
+  if (!next) return null;
+  if (!prev || prev.k !== next.k) return next;
+  let out = null;
+  for (const key in next) {
+    if (prev[key] !== next[key]) (out || (out = {}))[key] = next[key];
+  }
+  for (const key in prev) {
+    if (!(key in next)) (out || (out = {}))[key] = null;     // field cleared (e.g. left a vehicle)
+  }
+  return out;
 }

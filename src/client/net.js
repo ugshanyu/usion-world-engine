@@ -13,6 +13,7 @@
 import { angleDelta } from '../core/math.js';
 
 const RESERVED_EVENTS = new Set(['idle', 'heartbeat']);
+const STALE_MS = 250;                  // longer than this without an update = it stood still
 
 export function createNetClient(options = {}) {
   const Usion = options.Usion || (typeof window !== 'undefined' ? window.Usion : null);
@@ -25,6 +26,8 @@ export function createNetClient(options = {}) {
   let lastResyncAt = 0;
   let worldInfo = null;
   let joined = false;
+  let lastFrameAt = 0;
+  let frameGapMs = 66;
 
   const handlers = {
     onWorld: options.onWorld || (() => {}),
@@ -64,20 +67,35 @@ export function createNetClient(options = {}) {
         };
         entities.set(id, e);
       } else {
-        e.prev = e.curr;
+        // Snapshots are deltas: a missing field means "unchanged".
+        const c = e.curr;
+        const x = data.x ?? c.x;
+        const y = data.y ?? c.y;
+        const h = data.h ?? c.h;
         // Unwrap the angle so interpolation always takes the shortest arc.
-        const a = e.prev.a + angleDelta(e.prev.a, data.a || 0);
-        e.curr = { t: now, x: data.x, y: data.y, h: data.h, a };
+        const a = data.a === undefined ? c.a : c.a + angleDelta(c.a, data.a || 0);
+        // Something that stood still was not sent; when it starts moving
+        // again, interpolate from one snapshot interval ago, not from when
+        // it stopped (that would make it jump forward).
+        e.prev = now - c.t > STALE_MS ? { t: now - frameGapMs, x: c.x, y: c.y, h: c.h, a: c.a } : c;
+        e.curr = { t: now, x, y, h, a };
       }
-      Object.assign(e, data);
+      for (const key in data) {
+        if (data[key] === null) delete e[key];          // cleared field
+        else e[key] = data[key];
+      }
     }
     const removed = m.removed || [];
     // AOI churn is normal: ids enter and leave the visible slice constantly.
     for (let i = 0; i < removed.length; i++) entities.delete(removed[i]);
 
+    if (lastFrameAt) frameGapMs = Math.min(200, Math.max(30, now - lastFrameAt));
+    lastFrameAt = now;
+
     if (meId) {
       const self = entities.get(meId);
-      if (self) handlers.onSelf(self, m);
+      // `m.me` is the owner's exact state for prediction replay (direct mode).
+      if (self) handlers.onSelf(self, m.me || null, m);
     }
   }
 

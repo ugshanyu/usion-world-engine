@@ -13,6 +13,8 @@
 import { clamp, q, distSq2, wrapAngle } from './math.js';
 import { createRng } from './rng.js';
 import { CHARACTER, spawnCharacter, stepCharacter, applyImpulse, resolvePlayerPush } from './character.js';
+import { createRollers } from './rollers.js';
+import { normalizeInput } from './input.js';
 import {
   VEHICLE, createVehicle, stepVehicle, resolveVehiclePair, respawnVehicle, getSpec, seatPosition,
 } from './vehicle.js';
@@ -33,6 +35,7 @@ export const SIM_DEFAULTS = {
   maxProjectiles: 120,
   pickupRespawn: 20,
   eventBudget: 60,           // per-tick cap on broadcast events
+  maxInputQueue: 6,          // buffered inputs per player (~200 ms at 30 Hz)
 };
 
 const ZERO_INPUT = { mx: 0, mz: 0, aim: undefined, jump: false, sprint: false, dive: false };
@@ -42,8 +45,10 @@ const tmpAim = { x: 0, y: 0, z: 0 };
 
 export function createSimulation(options) {
   const world = options.world;
-  const config = { ...SIM_DEFAULTS, ...(options.config || {}) };
   const mode = options.mode || null;
+  // Mode settings (e.g. deathmatch start weapons) sit between the engine
+  // defaults and whatever the server explicitly passes.
+  const config = { ...SIM_DEFAULTS, ...((mode && mode.config) || {}), ...(options.config || {}) };
   const rng = options.rng || createRng(options.seed ?? 12345);
 
   const state = {
@@ -60,7 +65,10 @@ export function createSimulation(options) {
   let nextProjectileId = 1;
   const playerList = [];
   const vehicleList = [];
-  const traceCtx = { collision: world.collision, players: playerList, vehicles: vehicleList };
+  const traceCtx = { collision: world.collision, players: playerList, vehicles: vehicleList, ignoreVehicle: null };
+  const charCtx = { collision: world.collision, movers: world.movers, physics: world.physics, moverById: world.moverById };
+  const rollers = world.physics ? createRollers(world) : null;
+  const pushMove = world.physics ? (p, dx, dz) => world.physics.moveCharacter(p, dx, 0, dz) : null;
 
   // Parked vehicles come from the manifest and live for the world's lifetime.
   (world.vehicleSpawns || []).forEach((vs, i) => {
@@ -100,6 +108,8 @@ export function createSimulation(options) {
       joinedAt: state.t,
       lastSeq: 0,
       input: { ...ZERO_INPUT },
+      inputQueue: [],
+      teleports: 0,
       firing: false,
       pendingFallDamage: 0,
       pendingHazardDamage: 0,
@@ -121,37 +131,70 @@ export function createSimulation(options) {
     if (!p) return;
     leaveVehicle(p, true);
     delete state.players[id];
+    if (world.physics) world.physics.removeCharacter(id);
     refreshLists();
     if (mode && mode.onLeave) mode.onLeave(api, p);
   }
 
   /**
-   * Latest input wins — this is a realtime stream, not a command queue.
+   * Inputs that carry a `seq` (real clients) are QUEUED and consumed one per
+   * tick, so the server replays exactly what the phone predicted and the ack
+   * means "applied". Inputs without a seq (bots, tests) apply immediately.
    * Everything is clamped here so the rest of the sim can trust it.
    */
   function setInput(id, raw) {
     const p = state.players[id];
     if (!p || !raw) return;
-    const input = p.input;
-    input.mx = clamp(Number(raw.mx) || 0, -1, 1);
-    input.mz = clamp(Number(raw.mz) || 0, -1, 1);
-    input.aim = Number.isFinite(raw.aim) ? wrapAngle(Number(raw.aim)) : undefined;
-    input.jump = !!raw.jump;
-    input.sprint = !!raw.sprint;
-    input.dive = !!raw.dive;
-    input.throttle = clamp(Number(raw.throttle) || 0, -1, 1);
-    input.steer = clamp(Number(raw.steer) || 0, -1, 1);
-    input.handbrake = !!raw.handbrake;
-    input.fire = !!raw.fire;
-    input.aimX = Number(raw.aimX) || 0;
-    input.aimY = Number(raw.aimY) || 0;
-    input.aimZ = Number(raw.aimZ) || 0;
-    if (Number.isFinite(raw.seq)) p.lastSeq = Math.max(p.lastSeq, raw.seq | 0);
+    if (!Number.isFinite(raw.seq)) { applyInput(p, normalizeInput(raw, p.input)); return; }
+    const seq = raw.seq | 0;
+    const queue = p.inputQueue;
+    const newest = queue.length ? queue[queue.length - 1].seq : p.lastSeq;
+    if (seq <= newest) return;                        // duplicate or out of order
+    const entry = normalizeInput(raw, {});
+    entry.seq = seq;
+    queue.push(entry);
+    // A client whose clock runs fast would build latency forever: drop the
+    // oldest so we stay within ~maxInputQueue ticks of what it is doing now.
+    while (queue.length > config.maxInputQueue) queue.shift();
+  }
 
-    if (raw.use && !p.useHeld) { p.useHeld = true; toggleVehicle(p); }
-    else if (!raw.use) p.useHeld = false;
+  /** Pop this tick's input (or keep holding the last one if none arrived). */
+  function consumeInput(p) {
+    const next = p.inputQueue.length ? p.inputQueue.shift() : null;
+    if (!next) return;
+    Object.assign(p.input, next);
+    p.lastSeq = next.seq;
+    applyInput(p, p.input);
+  }
 
-    if (raw.weapon && p.weapons && p.weapons.indexOf(raw.weapon) !== -1) p.weapon = raw.weapon;
+  function applyInput(p, input) {
+    if (input.use && !p.useHeld) { p.useHeld = true; toggleVehicle(p); }
+    else if (!input.use) p.useHeld = false;
+    if (input.weapon && p.weapons && p.weapons.indexOf(input.weapon) !== -1) p.weapon = input.weapon;
+  }
+
+  /** Drop any buffered input (disconnects): the player stops instead of replaying stale keys. */
+  function clearInput(id) {
+    const p = state.players[id];
+    if (!p) return;
+    p.inputQueue.length = 0;
+    normalizeInput({}, p.input);
+  }
+
+  /**
+   * Move a player somewhere new (start grids, round resets): out of any
+   * vehicle, at rest, with every movement timer cleared. Bumps `teleports`
+   * so the owner's prediction snaps instead of smoothing across the jump.
+   */
+  function teleportPlayer(p, spot) {
+    leaveVehicle(p, true);
+    p.x = spot.x; p.y = spot.y ?? 0; p.z = spot.z;
+    p.yaw = spot.yaw || 0;
+    p.vx = 0; p.vy = 0; p.vz = 0;
+    p.stunT = 0; p.diveT = 0; p.getUpT = 0; p.jumpBuffer = 0; p.coyote = 0;
+    p.grounded = true;
+    p.rideId = null;
+    p.teleports = (p.teleports || 0) + 1;
   }
 
   function damagePlayer(p, amount, sourceId, cause) {
@@ -219,7 +262,13 @@ export function createSimulation(options) {
     }
     if (!best) return;
     if (!best.driver) { best.driver = p.id; p.seat = 0; }
-    else { best.passengers.push(p.id); p.seat = 1 + best.passengers.length; }
+    else {
+      // First free passenger seat (seats are 1…n-1; people leave out of order).
+      let seat = 1;
+      while (best.passengers.some(id => state.players[id] && state.players[id].seat === seat)) seat += 1;
+      best.passengers.push(p.id);
+      p.seat = seat;
+    }
     p.veh = best.id;
     p.vx = 0; p.vy = 0; p.vz = 0;
     best.lastDriver = best.driver;
@@ -263,6 +312,7 @@ export function createSimulation(options) {
     }
 
     muzzleOf(p, tmpMuzzle);
+    traceCtx.ignoreVehicle = p.veh || null;      // never hit the car you are firing from
     normalizeAim(p, p.input.aimX, p.input.aimY, p.input.aimZ, tmpAim);
     if (p.veh) {
       const v = state.vehicles[p.veh];
@@ -394,10 +444,13 @@ export function createSimulation(options) {
     state.t += dt;
     state.tick += 1;
     world.update(state.t);
+    if (rollers) rollers.preStep(api, dt);
+    if (world.physics) world.physics.step();
 
     if (mode && mode.preTick) mode.preTick(api, dt);
 
     // --- players
+    for (let i = 0; i < playerList.length; i++) consumeInput(playerList[i]);
     for (let i = 0; i < playerList.length; i++) {
       const p = playerList[i];
       if (p.hp <= 0) {
@@ -415,7 +468,7 @@ export function createSimulation(options) {
           p.vx = v.vx; p.vy = v.vy; p.vz = v.vz;
         }
       } else {
-        stepCharacter(p, p.input, dt, { collision: world.collision, movers: world.movers });
+        stepCharacter(p, p.input, dt, charCtx);
         if (config.fallDamage && p.pendingFallDamage) {
           const dmg = p.pendingFallDamage;
           p.pendingFallDamage = 0;
@@ -442,7 +495,7 @@ export function createSimulation(options) {
         const b = playerList[j];
         if (b.hp <= 0 || b.veh) continue;
         if (Math.abs(a.x - b.x) > 2 || Math.abs(a.z - b.z) > 2) continue;
-        resolvePlayerPush(a, b, dt);
+        resolvePlayerPush(a, b, dt, CHARACTER, pushMove);
       }
     }
 
@@ -499,7 +552,9 @@ export function createSimulation(options) {
     }
 
     // --- projectiles
+    traceCtx.ignoreVehicle = null;
     if (state.projectiles.length) stepProjectiles(state, dt, traceCtx, onProjectileHit);
+    if (rollers) rollers.postStep(api, dt);
 
     // --- pickups
     if (world.pickups.length) {
@@ -610,6 +665,7 @@ export function createSimulation(options) {
       const b = state.projectiles[i];
       out[b.id] = { k: 'b', x: q(b.x), y: q(b.z), h: q(b.y), t: b.weapon };
     }
+    if (rollers) rollers.project(out);
     for (let i = 0; i < world.pickups.length; i++) {
       const spec = world.pickups[i];
       if (!state.pickups[spec.id].ready) continue;
@@ -634,6 +690,23 @@ export function createSimulation(options) {
     return g;
   }
 
+  /**
+   * Everything the OWNER needs to replay its own prediction: exact (not
+   * quantized) position and velocity plus every movement timer, stamped with
+   * the world time of the tick that consumed input `ak`. Sent only to that
+   * player — nobody else needs it.
+   */
+  function projectSelf(id) {
+    const p = state.players[id];
+    if (!p) return null;
+    return {
+      t: state.t, ak: p.lastSeq, tp: p.teleports || 0,
+      x: p.x, y: p.y, z: p.z, vx: p.vx, vy: p.vy, vz: p.vz, yaw: p.yaw,
+      g: p.grounded ? 1 : 0, co: p.coyote, jb: p.jumpBuffer,
+      dv: p.diveT, dc: p.diveCd, st: p.stunT, gu: p.getUpT, rd: p.rideId || null,
+    };
+  }
+
   function drainEvents() {
     const out = events;
     events = [];
@@ -654,6 +727,9 @@ export function createSimulation(options) {
     step,
     projectEntities,
     projectGlobal,
+    projectSelf,
+    clearInput,
+    teleportPlayer,
     drainEvents,
     emit,
     damagePlayer,
@@ -666,6 +742,7 @@ export function createSimulation(options) {
     leaveVehicle,
     getPlayer: (id) => state.players[id],
     getVehicle: (id) => state.vehicles[id],
+    get rollers() { return rollers; },
     spawnVehicle(id, kind, x, y, z, yaw) {
       const v = createVehicle(id, kind, x, y, z, yaw);
       state.vehicles[id] = v;

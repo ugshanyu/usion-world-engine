@@ -157,13 +157,15 @@ describe('world server (direct mode)', () => {
     const start = keyframe.payload.entities.u2;
 
     const pump = setInterval(() => client.input({ mx: 0, mz: 1, aim: 0, seq: 42 }), 50);
+    // Entities arrive as deltas; the owner's own full state rides in `me`.
     const moved = await client.wait((f) => {
       if (f.type !== 'state_snapshot' || f.payload.keyframe) return false;
-      const me = f.payload.entities.u2;
-      return me && Math.hypot(me.x - start.x, me.y - start.y) > 2;
+      const me = f.payload.me;
+      return me && Math.hypot(me.x - start.x, me.z - start.y) > 2;
     }, 6000);
     clearInterval(pump);
-    expect(moved.payload.entities.u2.ak).toBeGreaterThanOrEqual(42);
+    expect(moved.payload.me.ak).toBe(42);
+    expect(moved.payload.ack).toBe(42);
     await client.close();
   });
 

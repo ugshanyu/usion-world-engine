@@ -11,6 +11,7 @@
  */
 import { clamp, approachAngle, length2, wrapAngle } from './math.js';
 import { resolveMovers, sampleMoverGround } from './movers.js';
+import { stepCharacterPhysics } from './character-physics.js';
 
 export const CHARACTER = {
   radius: 0.4,
@@ -37,6 +38,7 @@ export const CHARACTER = {
   pushRadius: 0.62,          // player-vs-player jostle radius
   pushStrength: 26,
   maxFallSpeed: 45,
+  groundStick: 2,            // physics backend: downward push that keeps the controller snapped
   fallDamageSpeed: 22,       // impact speed where fall damage starts
   fallDamagePerSpeed: 4.5,
 };
@@ -56,6 +58,7 @@ export function spawnCharacter(p, spawn) {
   p.stunT = 0;
   p.getUpT = 0;
   p.anim = 'idle';
+  p.rideId = null;
   p.veh = null;
   p.seat = -1;
   return p;
@@ -82,31 +85,12 @@ export function applyImpulse(p, ix, iy, iz, stun = 0) {
  * @param {object} ctx    {collision, movers, gravity?, config?}
  */
 export function stepCharacter(p, input, dt, ctx) {
+  if (ctx.physics) return stepCharacterPhysics(p, input, dt, ctx);
   const C = ctx.config || CHARACTER;
   const collision = ctx.collision;
   const movers = ctx.movers || [];
 
-  if (p.stunT > 0) p.stunT = Math.max(0, p.stunT - dt);
-  if (p.diveCd > 0) p.diveCd = Math.max(0, p.diveCd - dt);
-  if (p.getUpT > 0) p.getUpT = Math.max(0, p.getUpT - dt);
-
-  const stunned = p.stunT > 0 || p.getUpT > 0;
-  const diving = p.diveT > 0;
-  let mx = 0;
-  let mz = 0;
-
-  if (input && !stunned) {
-    mx = input.mx || 0;
-    mz = input.mz || 0;
-    const len = length2(mx, mz);
-    if (len > 1) { mx /= len; mz /= len; }
-    if (typeof input.aim === 'number') {
-      // Facing follows the aim/camera yaw; it snaps faster while moving.
-      p.yaw = approachAngle(p.yaw, input.aim, (len > 0.1 ? 14 : 9) * dt);
-    } else if (len > 0.1) {
-      p.yaw = approachAngle(p.yaw, Math.atan2(mx, mz), 12 * dt);
-    }
-  }
+  const ctl = beginCharacterStep(p, input, dt, C);
 
   // ---- ground probe -------------------------------------------------------
   const feetProbe = p.y + 0.25;
@@ -133,58 +117,9 @@ export function stepCharacter(p, input, dt, ctx) {
 
   const impactSpeed = wasGrounded ? 0 : -p.vy;
 
-  // ---- dive / jump --------------------------------------------------------
-  if (input && !stunned) {
-    if (input.jump) p.jumpBuffer = C.jumpBufferTime;
-    if (input.dive && !diving && p.diveCd <= 0 && (p.grounded || p.coyote > 0)) {
-      const fx = Math.sin(p.yaw);
-      const fz = Math.cos(p.yaw);
-      p.vx = fx * C.diveSpeed;
-      p.vz = fz * C.diveSpeed;
-      p.vy = C.diveUp;
-      p.diveT = C.diveTime;
-      p.diveCd = C.diveCooldown;
-      p.grounded = false;
-      p.coyote = 0;
-      p.jumpBuffer = 0;
-    }
-  }
-  if (p.jumpBuffer > 0) p.jumpBuffer = Math.max(0, p.jumpBuffer - dt);
-  if (p.jumpBuffer > 0 && (p.grounded || p.coyote > 0) && !diving && !stunned) {
-    p.vy = C.jumpSpeed;
-    p.grounded = false;
-    p.coyote = 0;
-    p.jumpBuffer = 0;
-  }
-
-  if (p.diveT > 0) {
-    p.diveT = Math.max(0, p.diveT - dt);
-    if (p.diveT === 0) p.getUpT = C.getUpTime;
-  }
-
-  // ---- horizontal movement ------------------------------------------------
-  const canSteer = !stunned && !diving;
-  const speedCap = input && input.sprint ? C.sprintSpeed : C.walkSpeed;
-  if (canSteer) {
-    const accel = p.grounded ? C.groundAccel : C.airAccel;
-    const targetX = mx * speedCap;
-    const targetZ = mz * speedCap;
-    p.vx += clamp(targetX - p.vx, -accel * dt, accel * dt);
-    p.vz += clamp(targetZ - p.vz, -accel * dt, accel * dt);
-    if (p.grounded && mx === 0 && mz === 0) {
-      const drop = C.groundFriction * dt;
-      const speed = length2(p.vx, p.vz);
-      const scale = speed > 0 ? Math.max(0, speed - drop) / speed : 0;
-      p.vx *= scale;
-      p.vz *= scale;
-    }
-  } else if (p.grounded) {
-    const drop = (diving ? 5 : 8) * dt;
-    const speed = length2(p.vx, p.vz);
-    const scale = speed > 0 ? Math.max(0, speed - drop) / speed : 0;
-    p.vx *= scale;
-    p.vz *= scale;
-  }
+  applyCharacterControls(p, input, dt, C, ctl);
+  const stunned = ctl.stunned;
+  const diving = ctl.diving;
 
   // ---- gravity / slopes ---------------------------------------------------
   if (p.grounded) {
@@ -237,13 +172,7 @@ export function stepCharacter(p, input, dt, ctx) {
         const m = push.mover;
         if (m && !m.rideable) {
           // Hazard bar: transfer its surface velocity, then knock you down.
-          const kick = m.push;
-          p.vx = push.vx * kick;
-          p.vz = push.vz * kick;
-          p.vy = Math.max(p.vy, 3.5 * Math.min(2, kick));
-          p.stunT = Math.max(p.stunT, 0.9);
-          p.grounded = false;
-          if (m.damage) p.pendingHazardDamage = (p.pendingHazardDamage || 0) + m.damage;
+          knockFromHazard(p, m, push.vx, push.vz);
         } else {
           cancelIntoNormal(p, push.x, 0, push.z);
         }
@@ -281,8 +210,124 @@ export function stepCharacter(p, input, dt, ctx) {
   return p;
 }
 
+/**
+ * Shared opening of a character step (both physics backends): tick the
+ * timers and turn the body toward the camera / stick. Returns a SHARED
+ * control record — read it before the next call.
+ */
+const ctlState = { mx: 0, mz: 0, stunned: false, diving: false };
+export function beginCharacterStep(p, input, dt, C) {
+  if (p.stunT > 0) p.stunT = Math.max(0, p.stunT - dt);
+  if (p.diveCd > 0) p.diveCd = Math.max(0, p.diveCd - dt);
+  if (p.getUpT > 0) p.getUpT = Math.max(0, p.getUpT - dt);
+
+  const stunned = p.stunT > 0 || p.getUpT > 0;
+  let mx = 0;
+  let mz = 0;
+  if (input && !stunned) {
+    mx = input.mx || 0;
+    mz = input.mz || 0;
+    const len = length2(mx, mz);
+    if (len > 1) { mx /= len; mz /= len; }
+    if (typeof input.aim === 'number') {
+      // Facing follows the aim/camera yaw; it snaps faster while moving.
+      p.yaw = approachAngle(p.yaw, input.aim, (len > 0.1 ? 14 : 9) * dt);
+    } else if (len > 0.1) {
+      p.yaw = approachAngle(p.yaw, Math.atan2(mx, mz), 12 * dt);
+    }
+  }
+  ctlState.mx = mx;
+  ctlState.mz = mz;
+  ctlState.stunned = stunned;
+  ctlState.diving = p.diveT > 0;
+  return ctlState;
+}
+
+/**
+ * Shared controls (both backends): dive, buffered jump with coyote time, and
+ * arcade horizontal acceleration / friction. Needs p.grounded and p.coyote
+ * to be current for this step.
+ */
+export function applyCharacterControls(p, input, dt, C, ctl) {
+  const { mx, mz, stunned, diving } = ctl;
+  if (input && !stunned) {
+    if (input.jump) p.jumpBuffer = C.jumpBufferTime;
+    if (input.dive && !diving && p.diveCd <= 0 && (p.grounded || p.coyote > 0)) {
+      const fx = Math.sin(p.yaw);
+      const fz = Math.cos(p.yaw);
+      p.vx = fx * C.diveSpeed;
+      p.vz = fz * C.diveSpeed;
+      p.vy = C.diveUp;
+      p.diveT = C.diveTime;
+      p.diveCd = C.diveCooldown;
+      p.grounded = false;
+      p.coyote = 0;
+      p.jumpBuffer = 0;
+    }
+  }
+  if (p.jumpBuffer > 0) p.jumpBuffer = Math.max(0, p.jumpBuffer - dt);
+  if (p.jumpBuffer > 0 && (p.grounded || p.coyote > 0) && !diving && !stunned) {
+    p.vy = C.jumpSpeed;
+    p.grounded = false;
+    p.coyote = 0;
+    p.jumpBuffer = 0;
+  }
+
+  if (p.diveT > 0) {
+    p.diveT = Math.max(0, p.diveT - dt);
+    if (p.diveT === 0) p.getUpT = C.getUpTime;
+  }
+
+  // ---- horizontal movement ------------------------------------------------
+  const canSteer = !stunned && !diving;
+  const speedCap = input && input.sprint ? C.sprintSpeed : C.walkSpeed;
+  if (canSteer) {
+    const accel = p.grounded ? C.groundAccel : C.airAccel;
+    const targetX = mx * speedCap;
+    const targetZ = mz * speedCap;
+    p.vx += clamp(targetX - p.vx, -accel * dt, accel * dt);
+    p.vz += clamp(targetZ - p.vz, -accel * dt, accel * dt);
+    if (p.grounded && mx === 0 && mz === 0) {
+      const drop = C.groundFriction * dt;
+      const speed = length2(p.vx, p.vz);
+      const scale = speed > 0 ? Math.max(0, speed - drop) / speed : 0;
+      p.vx *= scale;
+      p.vz *= scale;
+    }
+  } else if (p.grounded) {
+    const drop = (diving ? 5 : 8) * dt;
+    const speed = length2(p.vx, p.vz);
+    const scale = speed > 0 ? Math.max(0, speed - drop) / speed : 0;
+    p.vx *= scale;
+    p.vz *= scale;
+  }
+}
+
+/**
+ * A hazard (spinning bar, sweeper, rolling ball) hits a player: carry its
+ * surface velocity — never less than a firm shove away from it — then knock
+ * the player over. `awayX/awayZ` (optional, unit) is the fallback direction
+ * when the surface itself is barely moving (near a spinner's hub).
+ */
+export function knockFromHazard(p, m, svx, svz, awayX, awayZ) {
+  const kick = m.push ?? 1;
+  let vx = svx * kick;
+  let vz = svz * kick;
+  const minSpeed = 5 * kick;
+  if (awayX !== undefined && vx * vx + vz * vz < minSpeed * minSpeed) {
+    vx = awayX * minSpeed;
+    vz = awayZ * minSpeed;
+  }
+  p.vx = vx;
+  p.vz = vz;
+  p.vy = Math.max(p.vy, 3.5 * Math.min(2, kick));
+  p.stunT = Math.max(p.stunT, 0.9);
+  p.grounded = false;
+  if (m.damage) p.pendingHazardDamage = (p.pendingHazardDamage || 0) + m.damage;
+}
+
 /** Remove the velocity component pointing into a contact normal. */
-function cancelIntoNormal(p, nx, ny, nz) {
+export function cancelIntoNormal(p, nx, ny, nz) {
   const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
   if (len < 1e-6) return;
   nx /= len; ny /= len; nz /= len;
@@ -296,9 +341,10 @@ function cancelIntoNormal(p, nx, ny, nz) {
 /**
  * Player-vs-player jostle: equal-mass separation so a crowd funnelling
  * through a doorway shoves instead of overlapping. Runs once per step over
- * the whole roster (O(n) with the caller's spatial buckets).
+ * the whole roster (O(n) with the caller's spatial buckets). `move(p, dx, dz)`
+ * replaces the direct position change (the physics backend passes one).
  */
-export function resolvePlayerPush(a, b, dt, C = CHARACTER) {
+export function resolvePlayerPush(a, b, dt, C = CHARACTER, move = null) {
   const dx = b.x - a.x;
   const dz = b.z - a.z;
   const dy = b.y - a.y;
@@ -310,10 +356,17 @@ export function resolvePlayerPush(a, b, dt, C = CHARACTER) {
   const overlap = (minDist - d) * 0.5;
   const nx = dx / d;
   const nz = dz / d;
-  a.x -= nx * overlap;
-  a.z -= nz * overlap;
-  b.x += nx * overlap;
-  b.z += nz * overlap;
+  if (move) {
+    // Physics backend: separate through the character controller, so a
+    // shove can never push someone into (or through) a wall.
+    move(a, -nx * overlap, -nz * overlap);
+    move(b, nx * overlap, nz * overlap);
+  } else {
+    a.x -= nx * overlap;
+    a.z -= nz * overlap;
+    b.x += nx * overlap;
+    b.z += nz * overlap;
+  }
   const impulse = Math.min(overlap * C.pushStrength, 9) * dt * 30;
   a.vx -= nx * impulse * dt;
   a.vz -= nz * impulse * dt;

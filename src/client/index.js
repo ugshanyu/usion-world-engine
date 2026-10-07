@@ -16,6 +16,7 @@
 import { buildManifest } from '../worlds/index.js';
 import { buildWorld } from '../core/world.js';
 import { updateMovers } from '../core/movers.js';
+import { normalizeInput } from '../core/input.js';
 import { createRenderer } from './renderer.js';
 import { createControls } from './controls.js';
 import { createHud } from './hud.js';
@@ -50,7 +51,7 @@ const DEFAULT_LABELS = {
   weapons: {},
 };
 
-const INPUT_HZ = 20;
+const MAX_TICKS_PER_FRAME = 5;         // after a hitch, catch up this many ticks at most
 
 export async function start(options = {}) {
   const Usion = options.Usion || window.Usion;
@@ -81,8 +82,7 @@ export async function start(options = {}) {
   let manifest = null;
   let camera = null;
   let predictor = null;
-  let worldTime = 0;
-  let worldTimeTarget = 0;
+  let simDt = 1 / 30;
   let ready = false;
   let status = 'connecting';
 
@@ -91,8 +91,8 @@ export async function start(options = {}) {
     bufferMs: options.bufferMs,
     onWorld: (info) => setupWorld(info),
     onEvents: (list) => handleEvents(list),
-    onSelf: (self) => {
-      if (predictor) predictor.sync(self, (id) => net.getEntity(id));
+    onSelf: (self, exactState) => {
+      if (predictor) predictor.sync(self, exactState, (id) => net.getEntity(id));
       controls.setDriving(!!self.v);
     },
     onStatus: (next, err) => {
@@ -104,12 +104,25 @@ export async function start(options = {}) {
   });
   net.attach();
 
-  function setupWorld(info) {
-    if (world) return;
+  let settingUp = false;
+  async function setupWorld(info) {
+    if (world || settingUp) return;
+    settingUp = true;
     const spec = info.world || info;
+    simDt = 1 / (Number(info.sim_hz) || 30);
+    let rapier = null;
+    if (info.physics === 'rapier') {
+      try {
+        rapier = await loadRapier(options);
+      } catch (err) {
+        settingUp = false;
+        hud.overlay(labels.unsupported, String(err && err.message ? err.message : err), labels.retry, () => setupWorld(info));
+        return;
+      }
+    }
     manifest = buildManifest(spec);
-    world = buildWorld(manifest);
-    predictor = createPredictor(world);
+    world = buildWorld(manifest, { rapier, dt: simDt });
+    predictor = createPredictor(world, { dt: simDt });
     if (options.onWorldReady) options.onWorldReady(world, manifest);
     tryCreateRenderer();
     // A mount that never gains a size would otherwise hang on the loading
@@ -169,11 +182,12 @@ export async function start(options = {}) {
   }
   join();
 
-  // ---- input --------------------------------------------------------------
-  const inputTimer = setInterval(() => {
-    if (!net.joined || !ready) return;
+  // ---- input -------------------------------------------------------------
+  // One input per fixed tick, numbered, sent and predicted in the same step —
+  // the server applies them one per tick in the same order (see predict.js).
+  function sampleInput() {
     const input = controls.sample();
-    net.sendInput({
+    return {
       mx: round2(input.mx), mz: round2(input.mz),
       aim: round2(input.aim),
       jump: input.jump, sprint: input.sprint, dive: input.dive,
@@ -182,33 +196,38 @@ export async function start(options = {}) {
       fire: input.fire, use: input.use,
       aimX: round2(input.aimX), aimY: round2(input.aimY), aimZ: round2(input.aimZ),
       weapon: input.weapon || undefined,
-    });
-  }, Math.round(1000 / INPUT_HZ));
+    };
+  }
 
   // ---- frame --------------------------------------------------------------
   let lastFrame = performance.now();
+  let acc = 0;
   const selfView = {};
 
   function frame() {
     const now = performance.now();
-    const dt = Math.min(0.1, (now - lastFrame) / 1000) || 0.016;
+    const dt = Math.min(0.25, (now - lastFrame) / 1000) || 0.016;
     lastFrame = now;
 
-    // World time drives every hazard on both sides; nudge toward the server's
-    // clock rather than snapping, so platforms never stutter.
-    const globalState = net.global;
-    if (globalState && typeof globalState.t === 'number') worldTimeTarget = globalState.t;
-    worldTime += dt;
-    if (worldTimeTarget) {
-      const drift = worldTimeTarget - worldTime;
-      if (Math.abs(drift) > 1.5) worldTime = worldTimeTarget;
-      else worldTime += drift * Math.min(1, dt * 2);
+    // Fixed ticks, whatever the display's frame rate.
+    acc += dt;
+    let ticks = 0;
+    while (acc >= simDt && ticks < MAX_TICKS_PER_FRAME) {
+      const raw = sampleInput();
+      const seq = net.joined ? net.sendInput(raw) : 0;
+      predictor.tick(normalizeInput(raw), seq);
+      acc -= simDt;
+      ticks += 1;
     }
-    updateMovers(world.movers, worldTime);
+    if (ticks === MAX_TICKS_PER_FRAME) acc = 0;
+    const alpha = acc / simDt;
+    const globalState = net.global;
+    if (globalState) predictor.followServerTime(globalState.t, dt);
 
-    const input = controls.sample();
-    predictor.step(input, dt);
-    const me = predictor.view(selfView);
+    // Obstacles are drawn at the same moment as the (interpolated) player.
+    const worldTime = predictor.time - (1 - alpha) * simDt;
+    updateMovers(world.movers, worldTime);
+    const me = predictor.view(alpha, selfView);
 
     const view = net.getView(now);
     const meId = net.meId;
@@ -243,7 +262,7 @@ export async function start(options = {}) {
       hud.setHealth(self.hp ?? 100);
       hud.setWeapon(self.w, null);
     }
-    hud.setSpeed(predictor.driving ? predictor.view(selfView).speed * 3.6 : null);
+    hud.setSpeed(predictor.driving ? selfView.speed * 3.6 : null);
 
     const globalState = net.global;
     if (globalState) {
@@ -279,7 +298,6 @@ export async function start(options = {}) {
   }
 
   function destroy() {
-    clearInterval(inputTimer);
     ro?.disconnect();
     controls.destroy();
     hud.destroy();
@@ -320,6 +338,28 @@ function mergeLabels(base, extra) {
   out.phases = { ...base.phases, ...(extra.phases || {}) };
   out.weapons = { ...base.weapons, ...(extra.weapons || {}) };
   return out;
+}
+
+/**
+ * The Rapier physics module, for worlds whose server runs it. A game can pass
+ * an initialised namespace (`options.rapier`) or a URL to the ES module of
+ * `@dimforge/rapier3d-deterministic-compat` (`options.rapierUrl`, default
+ * `./rapier.mjs` next to the page). It is loaded once, only when needed.
+ */
+let rapierPromise = null;
+function loadRapier(options) {
+  if (options.rapier) return Promise.resolve(options.rapier);
+  if (!rapierPromise) {
+    const url = new URL(options.rapierUrl || './rapier.mjs', document.baseURI).href;
+    rapierPromise = import(/* @vite-ignore */ url)
+      .then(async (mod) => {
+        const R = mod.default || mod;
+        await R.init();
+        return R;
+      })
+      .catch((err) => { rapierPromise = null; throw err; });
+  }
+  return rapierPromise;
 }
 
 function round2(v) {

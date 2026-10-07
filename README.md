@@ -141,24 +141,70 @@ cost nothing on the wire.
 | **Combat** | hitscan and projectile weapons with spread, falloff, splash and knockback; server-side traces that cannot shoot through walls; melee shove; health, death, respawn |
 | **World** | moving hazards, ride-able platforms, conveyors, pickups, checkpoints and laps, goal zones, out-of-bounds kill |
 
+### Physics: arcade or Rapier
+
+By default the world is built from yawed boxes and ramps with the engine's own
+arcade collision. Pass `physics: 'rapier'` to `createWorldServer` and the world
+runs on [Rapier](https://rapier.rs) (`@dimforge/rapier3d-deterministic-compat`)
+instead:
+
+- real geometry: rotated boxes, ramps, and **meshes** (`manifest.meshes`,
+  e.g. exported from Blender) for floors, ramps and walls
+- the same arcade feel (acceleration, coyote time, jump buffering, dive,
+  stun) driven through Rapier's character controller: autostep, slope limits,
+  snap to ground
+- moving hazards that knock players over even when they swing *into* someone
+  standing still; ride-able platforms that carry you
+- **rollers** (`manifest.rollers`): balls that spawn on a schedule and tumble
+  down the level (server-simulated, interpolated on phones)
+- shoves between players go through the controller, so nobody is pushed into a wall
+
+The deterministic build gives byte-identical results in Node (ARM and x86),
+Chromium and WebKit — `node scripts/check-determinism.cjs` proves it for a full
+8-player match. Clients load Rapier only when the server's `joined` frame says
+`physics: 'rapier'`, from `options.rapierUrl` (default `./rapier.mjs` next to
+the page: serve `node_modules/@dimforge/rapier3d-deterministic-compat/dist/rapier.mjs`).
+An 8-player room costs ~0.08 ms per 30 Hz tick on the server.
+
 ## Networking
 
 Network entities use `x` = world X, `y` = world Z, `h` = height — the ground
 plane in `x`/`y` is what the platform's AOI grid slices on, so interest
 management works for free.
 
-The client predicts the local player by running the same step functions, then
-adopts the authoritative position on every snapshot and decays the visual
-difference over ~150 ms. Remote players are interpolated ~110 ms in the past in
-the arrival-time domain (no clock sync). Snapshot `seq` advances exactly once
-per tick, and unicast keyframes reuse it — the direct-mode pitfall that made
-remote players freeze and jump in earlier games.
+Everything runs in **fixed steps** (1/30 s by default) on both sides: the
+server accumulates real time and never stretches a step.
+
+**Prediction with replay.** The client sends one numbered input per tick and
+predicts it immediately with the same step functions. The server queues each
+player's inputs and applies exactly one per tick (bounded queue, so a fast
+client cannot build latency). Every snapshot carries `me` — the owner's exact
+state (position, velocity, every movement timer) right after the tick that
+applied input `ack`, stamped with that tick's world time. The client adopts it
+and replays every input the server has not applied yet, with obstacles posed
+at the times of the ticks they will run on. With nothing unexpected happening
+the replay reproduces the prediction exactly (tested to < 1 µm over a course
+full of obstacles, at 100 ms and 250 ms latency); anything unforeseen is
+corrected and the visual jump blended out over ~100 ms. Teleports snap.
+
+Remote players are interpolated ~110 ms in the past in the arrival-time domain
+(no clock sync). **Snapshots are deltas per player**: an entity is sent whole
+the first time a player sees it, then only its changed fields, and not at all
+while it stands still; each player receives at most the nearest
+`maxEntities` (96). Snapshot `seq` advances exactly once per tick, and unicast
+keyframes reuse it — the direct-mode pitfall that made remote players freeze
+and jump in earlier games.
+
+**Reconnects.** A dropped socket does not remove the player: they keep their
+place, body and progress for `graceMs` (15 s, the platform's grace) and are
+re-attached when they come back.
 
 ## Development
 
 ```bash
 npm install
-npm test        # 73 tests: collision, character, vehicle, modes, sim, world, live WebSocket protocol
+npm test        # collision, character, vehicle, modes, sim, world, Rapier physics, prediction replay, room, live WebSocket protocol
+node scripts/check-determinism.cjs   # same match hash in Node, Chromium and WebKit (needs Playwright browsers)
 npm run build   # dist/usion-world.js, dist/usion-world.min.js, dist/usion-world-engine.cjs.js
 ```
 

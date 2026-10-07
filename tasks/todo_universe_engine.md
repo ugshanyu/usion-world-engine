@@ -44,24 +44,25 @@ feel.** This repo stays outside `usionTheMobile`; only platform pieces
 
 ## Phase 1 — Fix World Engine's multiplayer basics (no physics change yet)
 Each item is a known bug from the study; each gets a test.
-- [ ] Fixed-step simulation: accumulator on server and client (never step
+- [x] Fixed-step simulation: accumulator on server and client (never step
       with wall-clock dt); `tickHz` actually used
-- [ ] Input queue per player (not "latest wins"); ack by `seq`
-- [ ] Client prediction with replay: reset own player to the acked server
+- [x] Input queue per player (not "latest wins"); ack by `seq`
+- [x] Client prediction with replay: reset own player to the acked server
       state, replay unacked inputs — own character/vehicle only, never a
       full-world snapshot (3.3 MB)
-- [ ] Disconnect grace (15 s, matching the platform) instead of instant removal
-- [ ] Smaller snapshots: send only changed fields, cap entities per observer,
+- [x] Disconnect grace (15 s, matching the platform) instead of instant removal
+- [x] Smaller snapshots: send only changed fields, cap entities per observer,
       serialize shared AOI cells once instead of once per player
-- [ ] Fix seat numbering, own-vehicle self-hit, `mode.config` never merged,
+      (done: deltas + cap; shared-cell serialization not needed at 8 players)
+- [x] Fix seat numbering, own-vehicle self-hit, `mode.config` never merged,
       race/elimination teleports while seated
 - [ ] Pin the SDK version; submit to the leaderboard when it's enabled
 - [ ] Load test: 200 bots for 1 hour on one process; record CPU, memory,
       bandwidth per player
 
 ## Phase 2 — Rapier as the physics core
-- [ ] Wrap Rapier behind the existing sim API (`collision.js`,
-      `character.js`, `vehicle.js` become thin Rapier wrappers); modes keep working
+- [x] Rapier behind the sim API for characters, movers and rollers
+      (`physics: 'rapier'`); vehicles still on the arcade model
 - [ ] Ship the shims from the spike in one place (`TextDecoder`,
       sync WebAssembly instantiate, `performance.now`)
 - [ ] Maps from Blender: build step that turns a `.glb` into (a) a compact
@@ -75,8 +76,8 @@ Each item is a known bug from the study; each gets a test.
       as data, not hard-coded
 - [ ] Dynamic props (boxes, balls, doors) simulated on the server, interpolated
       on phones
-- [ ] Determinism test in CI: run the scene in Node + WebKit + Chromium and
-      compare hashes on every change
+- [~] Determinism check: `scripts/check-determinism.cjs` (Node + Chromium +
+      WebKit, same hash); not yet wired into CI
 
 ## Phase 3 — Platform support (monorepo: `packages/rooms-runtime`, SDK)
 - [ ] rooms-runtime provides Rapier as a built-in library (like the blessed

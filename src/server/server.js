@@ -14,6 +14,7 @@
  *     worldSpec: { generator: 'city', options: { seed: 7, blocks: 6 } },
  *     mode: { id: 'race', laps: 2 },
  *     staticDir: './client',            // serves the game client too
+ *     physics: 'rapier',                // optional: real meshes, character controller, rolling balls
  *   });
  *
  * Deploying to Railway/Fly/EC2 is then just `node server.js` with
@@ -72,6 +73,8 @@ export async function createWorldServer(options = {}) {
     maxPlayers: options.maxPlayers ?? Number(env.MAX_PLAYERS || 200),
     seed: options.seed ?? (env.WORLD_SEED ? Number(env.WORLD_SEED) : 12345),
     staticDir: options.staticDir ?? env.STATIC_DIR ?? null,
+    graceMs: options.graceMs ?? Number(env.GRACE_MS || 15_000),
+    maxEntities: options.maxEntities ?? Number(env.MAX_ENTITIES || 96),
   };
   const log = createLogger(cfg.logLevel);
   const startedAt = Date.now();
@@ -79,6 +82,7 @@ export async function createWorldServer(options = {}) {
   const worldSpec = options.worldSpec || { generator: 'city', options: { seed: cfg.seed } };
   const manifest = buildManifest(worldSpec);
   const modeSpec = options.mode || 'freeroam';
+  const rapier = options.rapier || (options.physics === 'rapier' ? await loadRapier() : null);
 
   const verifier = options.verifier || createVerifier({
     serviceId: cfg.serviceId,
@@ -106,6 +110,9 @@ export async function createWorldServer(options = {}) {
         aoiRadius: cfg.aoiRadius,
         maxPlayers: cfg.maxPlayers,
         seed: cfg.seed,
+        rapier,
+        graceMs: cfg.graceMs,
+        maxEntities: cfg.maxEntities,
         log,
       });
       if (options.onRoomCreated) options.onRoomCreated(room);
@@ -208,6 +215,7 @@ export async function createWorldServer(options = {}) {
     snapshot_hz: cfg.snapshotHz,
     solids: manifest.solids.length,
     movers: manifest.movers.length,
+    physics: rapier ? 'rapier' : 'arcade',
   });
 
   return {
@@ -220,6 +228,14 @@ export async function createWorldServer(options = {}) {
     config: cfg,
     playerCount: totalPlayers,
   };
+}
+
+/** Load and initialise the deterministic Rapier build (optional dependency). */
+async function loadRapier() {
+  const mod = await import('@dimforge/rapier3d-deterministic-compat');
+  const R = mod.default || mod;
+  await R.init();
+  return R;
 }
 
 function notFound(res) {

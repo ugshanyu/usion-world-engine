@@ -121,8 +121,7 @@ export function raceMode(options = {}) {
     const grid = sim.world.spawns.filter(s => s.tag === 'grid');
     if (grid.length) {
       const slot = grid[sim.players.indexOf(p) % grid.length];
-      p.x = slot.x; p.y = slot.y; p.z = slot.z; p.yaw = slot.yaw || 0;
-      p.vx = 0; p.vy = 0; p.vz = 0;
+      sim.teleportPlayer(p, slot);
     }
   }
 }

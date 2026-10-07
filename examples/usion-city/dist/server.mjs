@@ -256,7 +256,7 @@ function createGate({ verifier, getRoom, requestJoin, log, idleFrameMs = 15_000 
     ws.on('close', () => {
       connections.delete(ws);
       if (conn.session && conn.joined) {
-        getRoom(conn.session.roomId)?.removePlayer(conn.session.userId, ws, 'disconnected');
+        getRoom(conn.session.roomId)?.disconnectPlayer(conn.session.userId, ws);
       }
     });
     ws.on('error', () => { /* 'close' follows and cleans up */ });
@@ -927,6 +927,750 @@ function sampleMoverGround(movers, x, z, fromY, radius = 0) {
 }
 
 /**
+ * Rapier physics backend.
+ *
+ * The core never imports Rapier itself: the host passes in an initialised
+ * RAPIER namespace (`@dimforge/rapier3d-deterministic-compat`), so the same
+ * code runs in Node, in the browser and — once the platform provides Rapier —
+ * inside the rooms-runtime sandbox. The deterministic build gives
+ * byte-identical results on every engine and CPU we ship to
+ * (spikes/rapier/RESULTS.md), which is what lets a phone predict its own
+ * player against the exact geometry the server simulates.
+ *
+ * What lives in the Rapier world:
+ *   - static geometry: manifest boxes, ramps (convex wedges) and meshes
+ *     (trimeshes, e.g. exported from Blender)
+ *   - movers: colliders posed from world time (movers.js computes the pose;
+ *     this file only mirrors it), so they cost no bandwidth
+ *   - rollers: dynamic balls, simulated on the server only
+ *   - one capsule per player, used purely as the character controller's
+ *     shape. Player capsules collide with NOTHING — the controller moves them,
+ *     and players jostle each other through the soft push in character.js.
+ *
+ * Collision groups (membership << 16 | filter):
+ */
+const GROUP = {
+  STATIC: 0x1,
+  RIDE: 0x2,       // platforms, pistons, conveyors: block and carry
+  HAZARD: 0x4,     // spinners, sweepers: block and knock you down
+  PLAYER: 0x8,
+  ROLLER: 0x10,    // dynamic balls
+};
+
+const ALL = 0xffff;
+const groups = (membership, filter) => ((membership & 0xffff) << 16) | (filter & 0xffff);
+
+// The character controller sees the level and the movers, never other
+// players (soft push) or rollers (they knock you over instead of blocking).
+const MOVE_GROUPS = groups(GROUP.PLAYER, GROUP.STATIC | GROUP.RIDE | GROUP.HAZARD);
+const GROUND_GROUPS = groups(GROUP.PLAYER, GROUP.STATIC | GROUP.RIDE);
+const KNOCK_GROUPS = groups(GROUP.PLAYER, GROUP.HAZARD | GROUP.ROLLER);
+
+/** Quaternion for a rotation of `ry` radians about +Y (the engine's yaw). */
+function yawQuat(ry, out) {
+  out.x = 0; out.y = Math.sin(ry / 2); out.z = 0; out.w = Math.cos(ry / 2);
+  return out;
+}
+
+/**
+ * @param {object} R        initialised RAPIER namespace
+ * @param {object} manifest normalised world manifest
+ * @param {Array}  movers   runtime movers from movers.js (already posed at t=0)
+ * @param {object} [opts]   {character: CHARACTER constants, gravity}
+ */
+function createPhysics(R, manifest, movers, opts = {}) {
+  const C = opts.character;
+  const world = new R.World({ x: 0, y: -(opts.gravity ?? 20), z: 0 });
+  world.timestep = opts.dt ?? 1 / 30;
+  const q = { x: 0, y: 0, z: 0, w: 1 };
+
+  // ---- static level -------------------------------------------------------
+  const staticGroups = groups(GROUP.STATIC, ALL);
+  for (const s of manifest.solids) {
+    if (s.solid === false) continue;
+    let desc;
+    if (s.kind === 'ramp') {
+      // Wedge rising along local +Z, matching collision.js ramps exactly.
+      desc = R.ColliderDesc.convexHull(new Float32Array([
+        -s.hx, -s.hy, -s.hz, s.hx, -s.hy, -s.hz,
+        -s.hx, -s.hy, s.hz, s.hx, -s.hy, s.hz,
+        -s.hx, s.hy, s.hz, s.hx, s.hy, s.hz,
+      ]));
+    } else {
+      desc = R.ColliderDesc.cuboid(s.hx, s.hy, s.hz);
+    }
+    desc.setTranslation(s.x, s.y, s.z).setRotation(yawQuat(s.ry || 0, q)).setCollisionGroups(staticGroups);
+    world.createCollider(desc);
+  }
+  for (const mesh of manifest.meshes || []) {
+    const desc = R.ColliderDesc.trimesh(Float32Array.from(mesh.vertices), Uint32Array.from(mesh.indices));
+    desc.setCollisionGroups(staticGroups);
+    world.createCollider(desc);
+  }
+  if (manifest.groundY !== null && manifest.groundY !== undefined) {
+    const b = manifest.bounds;
+    const hx = (b.maxX - b.minX) / 2 + 50;
+    const hz = (b.maxZ - b.minZ) / 2 + 50;
+    world.createCollider(R.ColliderDesc.cuboid(hx, 1, hz)
+      .setTranslation((b.minX + b.maxX) / 2, manifest.groundY - 1, (b.minZ + b.maxZ) / 2)
+      .setCollisionGroups(staticGroups));
+  }
+
+  // ---- movers -------------------------------------------------------------
+  // Movers are STANDALONE colliders (no rigid body) re-posed every tick.
+  // Rapier treats them like fixed geometry, which matters: on kinematic
+  // bodies the character controller silently adds platform motion, and only
+  // when the body was moved with setNextKinematic* — the server and a phone
+  // replaying history would then disagree. Our own carry (character-physics)
+  // is identical on both sides.
+  const moverByCollider = new Map();
+  const moverColliders = [];
+  for (const m of movers) {
+    const s = m.solid;
+    const col = world.createCollider(R.ColliderDesc.cuboid(s.hx, s.hy, s.hz)
+      .setTranslation(s.x, s.y, s.z).setRotation(yawQuat(s.ry, q))
+      .setCollisionGroups(groups(m.rideable ? GROUP.RIDE : GROUP.HAZARD, ALL)));
+    moverByCollider.set(col.handle, m);
+    moverColliders.push({ m, col });
+  }
+
+  /** Mirror the movers' current poses (set by updateMovers) into Rapier. */
+  const v3 = { x: 0, y: 0, z: 0 };
+  function syncMovers() {
+    for (let i = 0; i < moverColliders.length; i++) {
+      const { m, col } = moverColliders[i];
+      const s = m.solid;
+      v3.x = s.x; v3.y = s.y; v3.z = s.z;
+      col.setTranslation(v3);
+      col.setRotation(yawQuat(s.ry, q));
+    }
+  }
+
+  // ---- rollers (server-only dynamic balls) --------------------------------
+  const rollers = new Map();      // id → {id, body, collider, r}
+  const rollerByCollider = new Map();
+  function addRoller(id, x, y, z, r, vx = 0, vy = 0, vz = 0) {
+    const body = world.createRigidBody(R.RigidBodyDesc.dynamic()
+      .setTranslation(x, y, z).setLinvel(vx, vy, vz).setCcdEnabled(true));
+    const collider = world.createCollider(R.ColliderDesc.ball(r).setDensity(2).setRestitution(0.2)
+      // PLAYER in the filter only makes balls visible to the knock query:
+      // player capsules accept no contacts, so balls never bounce off people.
+      .setFriction(0.8).setCollisionGroups(groups(GROUP.ROLLER,
+        GROUP.STATIC | GROUP.RIDE | GROUP.HAZARD | GROUP.ROLLER | GROUP.PLAYER)), body);
+    const roller = { id, body, collider, r };
+    rollers.set(id, roller);
+    rollerByCollider.set(collider.handle, roller);
+    return roller;
+  }
+  function removeRoller(id) {
+    const roller = rollers.get(id);
+    if (!roller) return;
+    rollerByCollider.delete(roller.collider.handle);
+    world.removeRigidBody(roller.body);
+    rollers.delete(id);
+  }
+
+  // ---- characters ---------------------------------------------------------
+  const halfHeight = (C.height - 2 * C.radius) / 2;
+  const centerY = C.radius + halfHeight;            // feet → capsule centre
+  const capsules = new Map();                        // player id → collider
+  const capsuleShape = new R.Capsule(halfHeight, C.radius);
+
+  const kcc = world.createCharacterController(0.02);
+  kcc.enableAutostep(C.stepHeight, 0.2, false);
+  kcc.enableSnapToGround(0.3);
+  kcc.setMaxSlopeClimbAngle(Math.acos(C.maxSlopeNormalY));
+  kcc.setMinSlopeSlideAngle(Math.acos(C.maxSlopeNormalY));
+  kcc.setApplyImpulsesToDynamicBodies(false);
+
+  function capsuleOf(p) {
+    let col = capsules.get(p.id);
+    if (!col) {
+      col = world.createCollider(R.ColliderDesc.capsule(halfHeight, C.radius)
+        .setTranslation(p.x, p.y + centerY, p.z)
+        .setCollisionGroups(groups(GROUP.PLAYER, 0)));     // collides with nothing
+      capsules.set(p.id, col);
+    }
+    return col;
+  }
+  function removeCharacter(id) {
+    const col = capsules.get(id);
+    if (!col) return;
+    world.removeCollider(col, false);
+    capsules.delete(id);
+  }
+
+  /**
+   * Move a player by (dx, dy, dz) with the character controller.
+   * Mutates p.x/y/z and returns a SHARED result — read it before the next call.
+   */
+  const moveResult = { grounded: false, x: 0, y: 0, z: 0, contacts: 0 };
+  const contacts = [];          // reused: {nx, ny, nz, mover}
+  const delta = { x: 0, y: 0, z: 0 };
+  function moveCharacter(p, dx, dy, dz) {
+    const col = capsuleOf(p);
+    v3.x = p.x; v3.y = p.y + centerY; v3.z = p.z;
+    col.setTranslation(v3);
+    delta.x = dx; delta.y = dy; delta.z = dz;
+    kcc.computeColliderMovement(col, delta, undefined, MOVE_GROUPS);
+    const m = kcc.computedMovement();
+    p.x += m.x; p.y += m.y; p.z += m.z;
+    v3.x = p.x; v3.y = p.y + centerY; v3.z = p.z;
+    col.setTranslation(v3);
+    moveResult.grounded = kcc.computedGrounded();
+    moveResult.x = m.x; moveResult.y = m.y; moveResult.z = m.z;
+    const n = kcc.numComputedCollisions();
+    moveResult.contacts = n;
+    for (let i = 0; i < n; i++) {
+      const hit = kcc.computedCollision(i);
+      let c = contacts[i];
+      if (!c) contacts[i] = c = { nx: 0, ny: 0, nz: 0, mover: null };
+      const nrm = hit.normal1;
+      c.nx = nrm.x; c.ny = nrm.y; c.nz = nrm.z;
+      c.mover = hit.collider ? (moverByCollider.get(hit.collider.handle) || null) : null;
+    }
+    return moveResult;
+  }
+
+  /** What is directly under a player's feet: {normalY, mover} or null. */
+  const ray = new R.Ray({ x: 0, y: 0, z: 0 }, { x: 0, y: -1, z: 0 });
+  const groundResult = { normalY: 1, mover: null };
+  function groundUnder(p, reach = 0.35) {
+    ray.origin.x = p.x; ray.origin.y = p.y + 0.15; ray.origin.z = p.z;
+    const hit = world.castRayAndGetNormal(ray, 0.15 + reach, true, undefined, GROUND_GROUPS);
+    if (!hit) return null;
+    groundResult.normalY = hit.normal.y;
+    groundResult.mover = moverByCollider.get(hit.collider.handle) || null;
+    return groundResult;
+  }
+
+  /**
+   * Hazards and rollers overlapping a player — catches a spinning bar that
+   * swings INTO a player standing still, which the controller (it only
+   * resolves the player's own motion) never reports.
+   */
+  const pos = { x: 0, y: 0, z: 0 };
+  const ident = { x: 0, y: 0, z: 0, w: 1 };
+  function overlapKnockers(p, cb) {
+    pos.x = p.x; pos.y = p.y + centerY; pos.z = p.z;
+    world.intersectionsWithShape(pos, ident, capsuleShape, (collider) => {
+      const h = collider.handle;
+      const mover = moverByCollider.get(h);
+      if (mover) cb(mover, null);
+      else {
+        const roller = rollerByCollider.get(h);
+        if (roller) cb(null, roller);
+      }
+      return true;
+    }, undefined, KNOCK_GROUPS);
+  }
+
+  return {
+    R,
+    world,
+    centerY,
+    syncMovers,
+    step() { world.step(); },
+    moveCharacter,
+    contacts,
+    groundUnder,
+    overlapKnockers,
+    removeCharacter,
+    addRoller,
+    removeRoller,
+    rollers,
+    free() { world.free(); },
+  };
+}
+
+/**
+ * On-foot character step on the Rapier backend.
+ *
+ * Same feel as the arcade backend in character.js — it shares the controls
+ * (`beginCharacterStep` / `applyCharacterControls`) and the hazard knock —
+ * but collision is Rapier's character controller against real geometry:
+ * meshes, rotated boxes, ramps and kinematic movers, with autostep, slope
+ * limits and snap-to-ground.
+ *
+ * Deterministic and allocation-free in the hot path: the phone runs this
+ * exact function to predict (and replay) the local player.
+ */
+
+const surface = { vx: 0, vy: 0, vz: 0 };
+
+/**
+ * @param {object} p      player entity (mutated in place)
+ * @param {object} input  {mx, mz, aim, jump, sprint, dive}
+ * @param {number} dt     seconds (fixed step)
+ * @param {object} ctx    {physics, movers, moverById, config?}
+ */
+function stepCharacterPhysics(p, input, dt, ctx) {
+  const C = ctx.config || CHARACTER;
+  const phys = ctx.physics;
+
+  const ctl = beginCharacterStep(p, input, dt);
+
+  // Grounded state comes from the controller's previous move.
+  const wasGrounded = p.grounded;
+  if (p.grounded) p.coyote = C.coyoteTime;
+  else if (p.coyote > 0) p.coyote = Math.max(0, p.coyote - dt);
+  const impactSpeed = wasGrounded ? 0 : -p.vy;
+
+  applyCharacterControls(p, input, dt, C, ctl);
+  const knockedBefore = p.stunT;
+
+  // ---- gravity ------------------------------------------------------------
+  if (p.grounded && p.vy <= 0) {
+    p.vy = -C.groundStick;
+  } else {
+    p.vy -= C.gravity * dt;
+    if (p.vy < -C.maxFallSpeed) p.vy = -C.maxFallSpeed;
+  }
+
+  // ---- ride platforms -----------------------------------------------------
+  let carryX = 0, carryY = 0, carryZ = 0;
+  const rider = p.rideId ? ctx.moverById.get(p.rideId) : null;
+  if (rider) {
+    moverVelocityAt(rider, p.x, p.z, surface);
+    carryX = surface.vx * dt;
+    carryZ = surface.vz * dt;
+    carryY = surface.vy * dt;
+  }
+
+  // ---- move ---------------------------------------------------------------
+  const res = phys.moveCharacter(p, p.vx * dt + carryX, p.vy * dt + carryY, p.vz * dt + carryZ);
+  for (let i = 0; i < res.contacts; i++) {
+    const c = phys.contacts[i];
+    const m = c.mover;
+    if (m && !m.rideable) {
+      moverVelocityAt(m, p.x, p.z, surface);
+      const nl = length2(c.nx, c.nz) || 1;
+      knockFromHazard(p, m, surface.vx, surface.vz, c.nx / nl, c.nz / nl);
+      p.diveT = 0;
+    } else {
+      cancelIntoNormal(p, c.nx, c.ny, c.nz);
+    }
+  }
+
+  // ---- hazards that swept INTO us -----------------------------------------
+  if (p.stunT === knockedBefore) {
+    phys.overlapKnockers(p, (m, roller) => {
+      if (p.stunT !== knockedBefore) return;     // one knock per step
+      let ax = p.x, az = p.z;
+      if (m) {
+        moverVelocityAt(m, p.x, p.z, surface);
+        ax -= m.solid.x; az -= m.solid.z;
+        const al = length2(ax, az) || 1;
+        knockFromHazard(p, m, surface.vx, surface.vz, ax / al, az / al);
+      } else {
+        const v = roller.body.linvel();
+        const t = roller.body.translation();
+        ax -= t.x; az -= t.z;
+        const al = length2(ax, az) || 1;
+        knockFromHazard(p, roller, v.x, v.z, ax / al, az / al);
+      }
+      p.diveT = 0;
+    });
+  }
+
+  // ---- ground -------------------------------------------------------------
+  const rising = p.vy > 0.001 && p.stunT === knockedBefore;
+  const ground = rising ? null : phys.groundUnder(p);
+  p.grounded = !rising && res.grounded && !!ground && ground.normalY >= C.maxSlopeNormalY;
+  p.rideId = p.grounded && ground.mover && ground.mover.rideable ? ground.mover.id : null;
+  if (p.grounded) {
+    if (p.vy < 0) p.vy = 0;
+    if (!wasGrounded && impactSpeed > C.fallDamageSpeed) {
+      p.pendingFallDamage = Math.round((impactSpeed - C.fallDamageSpeed) * C.fallDamagePerSpeed);
+    }
+  } else if (p.vy > 0 && res.y < (p.vy * dt + carryY) * 0.5) {
+    p.vy = 0;                                    // bumped a ceiling
+  }
+
+  p.yaw = wrapAngle(p.yaw);
+  p.anim = p.stunT > 0 ? 'stun'
+    : p.diveT > 0 ? 'dive'
+      : p.getUpT > 0 ? 'getup'
+        : !p.grounded ? 'air'
+          : length2(p.vx, p.vz) > 0.6 ? (input && input.sprint ? 'sprint' : 'run')
+            : 'idle';
+  return p;
+}
+
+/**
+ * On-foot character controller.
+ *
+ * The feel is deliberately arcade — Fall Guys, not a milsim: quick
+ * acceleration, generous air control, a committed dive, and players who bump
+ * and jostle each other instead of passing through. It is also deterministic
+ * and allocation-free, because the client runs this exact function to predict
+ * the local player while the server runs it as the authority.
+ *
+ * Positions are FEET positions (`y` is ground height, not the capsule centre).
+ */
+
+const CHARACTER = {
+  radius: 0.4,
+  height: 1.8,
+  eyeHeight: 1.6,
+  walkSpeed: 5.6,
+  sprintSpeed: 8.6,
+  groundAccel: 48,
+  airAccel: 14,
+  groundFriction: 11,
+  airDrag: 0.25,
+  gravity: 24,
+  jumpSpeed: 9.2,
+  coyoteTime: 0.12,
+  jumpBufferTime: 0.15,
+  stepHeight: 0.55,
+  maxSlopeNormalY: 0.64,     // ≈ 50°: steeper than this and you slide
+  slideAccel: 16,
+  diveSpeed: 10.5,
+  diveUp: 3.6,
+  diveTime: 0.55,
+  getUpTime: 0.4,
+  diveCooldown: 0.9,
+  pushRadius: 0.62,          // player-vs-player jostle radius
+  pushStrength: 26,
+  maxFallSpeed: 45,
+  groundStick: 2,            // physics backend: downward push that keeps the controller snapped
+  fallDamageSpeed: 22,       // impact speed where fall damage starts
+  fallDamagePerSpeed: 4.5,
+};
+
+const push$1 = { x: 0, y: 0, z: 0, hit: false, mover: null, vx: 0, vy: 0, vz: 0 };
+
+/** Reset a player to a spawn point, on foot and fully healed. */
+function spawnCharacter(p, spawn) {
+  p.x = spawn.x; p.y = spawn.y; p.z = spawn.z;
+  p.vx = 0; p.vy = 0; p.vz = 0;
+  p.yaw = spawn.yaw || 0;
+  p.grounded = true;
+  p.coyote = 0;
+  p.jumpBuffer = 0;
+  p.diveT = 0;
+  p.diveCd = 0;
+  p.stunT = 0;
+  p.getUpT = 0;
+  p.anim = 'idle';
+  p.rideId = null;
+  p.veh = null;
+  p.seat = -1;
+  return p;
+}
+
+/** Knock a player about — car hits, explosions, spinner bars, shoves. */
+function applyImpulse(p, ix, iy, iz, stun = 0) {
+  p.vx += ix;
+  p.vy += iy;
+  p.vz += iz;
+  if (stun > 0) {
+    p.stunT = Math.max(p.stunT || 0, stun);
+    p.diveT = 0;
+    p.grounded = false;
+  }
+}
+
+/**
+ * Advance one on-foot player by `dt`.
+ *
+ * @param {object} p      player entity (mutated in place)
+ * @param {object} input  {mx, mz, aim, jump, sprint, dive}
+ * @param {number} dt     seconds
+ * @param {object} ctx    {collision, movers, gravity?, config?}
+ */
+function stepCharacter(p, input, dt, ctx) {
+  if (ctx.physics) return stepCharacterPhysics(p, input, dt, ctx);
+  const C = ctx.config || CHARACTER;
+  const collision = ctx.collision;
+  const movers = ctx.movers || [];
+
+  const ctl = beginCharacterStep(p, input, dt);
+
+  // ---- ground probe -------------------------------------------------------
+  const feetProbe = p.y + 0.25;
+  const ground = collision.sampleGround(p.x, p.z, feetProbe, C.radius * 0.9);
+  const moverGround = sampleMoverGround(movers, p.x, p.z, feetProbe, C.radius * 0.9);
+  let groundY = ground.y;
+  let groundNormalY = ground.normalY;
+  let rider = null;
+  if (moverGround.mover && moverGround.y >= groundY) {
+    groundY = moverGround.y;
+    groundNormalY = 1;
+    rider = moverGround.mover;
+  }
+
+  const wasGrounded = p.grounded;
+  const nearGround = groundY > -Infinity && p.y <= groundY + 0.08 && p.vy <= 0.001;
+  const steep = groundNormalY < C.maxSlopeNormalY;
+  p.grounded = nearGround && !steep;
+  if (p.grounded) {
+    p.coyote = C.coyoteTime;
+  } else if (p.coyote > 0) {
+    p.coyote = Math.max(0, p.coyote - dt);
+  }
+
+  const impactSpeed = wasGrounded ? 0 : -p.vy;
+
+  applyCharacterControls(p, input, dt, C, ctl);
+  const diving = ctl.diving;
+
+  // ---- gravity / slopes ---------------------------------------------------
+  if (p.grounded) {
+    if (p.vy < 0) p.vy = 0;
+  } else {
+    p.vy -= C.gravity * dt;
+    if (p.vy < -C.maxFallSpeed) p.vy = -C.maxFallSpeed;
+  }
+  if (nearGround && steep) {
+    p.vx += ground.slopeX * C.slideAccel * dt;
+    p.vz += ground.slopeZ * C.slideAccel * dt;
+  }
+  if (rider) {
+    // Ride the platform: carry its motion without fighting the ground snap.
+    p.x += rider.vx * dt;
+    p.z += rider.vz * dt;
+    if (rider.vy > 0) p.y += rider.vy * dt;
+  }
+
+  // ---- integrate ----------------------------------------------------------
+  p.x += p.vx * dt;
+  p.y += p.vy * dt;
+  p.z += p.vz * dt;
+
+  // ---- static + mover collision ------------------------------------------
+  // Only the UPPER body is resolved against solids: anything below the step
+  // height is the ground probe's job. Sampling a sphere at ankle level fights
+  // the ground snap on every ramp and kerb, which reads as walking through
+  // treacle up a slope.
+  const r = C.radius;
+  const heights = diving
+    ? [r + 0.1, r * 2]
+    : [C.stepHeight + r * 0.5, C.height * 0.55, C.height - r];
+  for (let i = 0; i < heights.length; i++) {
+    const cy = p.y + heights[i];
+    const fix = collision.resolveSphere(p.x, cy, p.z, r);
+    if (fix.hit) {
+      p.x += fix.x;
+      p.z += fix.z;
+      if (fix.y > 0 && p.vy < 0) { p.y += fix.y; p.vy = 0; }
+      else if (fix.y < 0 && p.vy > 0) { p.y += fix.y; p.vy = 0; }
+      cancelIntoNormal(p, fix.x, 0, fix.z);
+    }
+    if (movers.length) {
+      resolveMovers(movers, p.x, p.y + heights[i], p.z, r, push$1);
+      if (push$1.hit) {
+        p.x += push$1.x;
+        p.z += push$1.z;
+        if (push$1.y !== 0) p.y += push$1.y;
+        const m = push$1.mover;
+        if (m && !m.rideable) {
+          // Hazard bar: transfer its surface velocity, then knock you down.
+          knockFromHazard(p, m, push$1.vx, push$1.vz);
+        } else {
+          cancelIntoNormal(p, push$1.x, 0, push$1.z);
+        }
+      }
+    }
+  }
+
+  // ---- ground snap + step up ---------------------------------------------
+  const after = collision.sampleGround(p.x, p.z, p.y + (p.grounded ? C.stepHeight : 0.08), C.radius * 0.9);
+  const afterMover = sampleMoverGround(movers, p.x, p.z, p.y + (p.grounded ? C.stepHeight : 0.15), C.radius * 0.9);
+  let snapY = after.y;
+  if (afterMover.mover && afterMover.y > snapY) snapY = afterMover.y;
+  if (snapY > -Infinity) {
+    if (p.y < snapY) {
+      p.y = snapY;
+      if (p.vy < 0) p.vy = 0;
+      p.grounded = after.normalY >= C.maxSlopeNormalY || afterMover.mover != null;
+      // Landing is detected HERE, not before integration: at terminal velocity
+      // a body covers 1.5 m per tick and would never be seen "near" the floor.
+      if (impactSpeed > C.fallDamageSpeed) {
+        p.pendingFallDamage = Math.round((impactSpeed - C.fallDamageSpeed) * C.fallDamagePerSpeed);
+      }
+    } else if (p.grounded && p.y - snapY < 0.2) {
+      p.y = snapY;
+    }
+  }
+
+  p.yaw = wrapAngle(p.yaw);
+  p.anim = p.stunT > 0 ? 'stun'
+    : p.diveT > 0 ? 'dive'
+      : p.getUpT > 0 ? 'getup'
+        : !p.grounded ? 'air'
+          : length2(p.vx, p.vz) > 0.6 ? (input && input.sprint ? 'sprint' : 'run')
+            : 'idle';
+  return p;
+}
+
+/**
+ * Shared opening of a character step (both physics backends): tick the
+ * timers and turn the body toward the camera / stick. Returns a SHARED
+ * control record — read it before the next call.
+ */
+const ctlState = { mx: 0, mz: 0, stunned: false, diving: false };
+function beginCharacterStep(p, input, dt, C) {
+  if (p.stunT > 0) p.stunT = Math.max(0, p.stunT - dt);
+  if (p.diveCd > 0) p.diveCd = Math.max(0, p.diveCd - dt);
+  if (p.getUpT > 0) p.getUpT = Math.max(0, p.getUpT - dt);
+
+  const stunned = p.stunT > 0 || p.getUpT > 0;
+  let mx = 0;
+  let mz = 0;
+  if (input && !stunned) {
+    mx = input.mx || 0;
+    mz = input.mz || 0;
+    const len = length2(mx, mz);
+    if (len > 1) { mx /= len; mz /= len; }
+    if (typeof input.aim === 'number') {
+      // Facing follows the aim/camera yaw; it snaps faster while moving.
+      p.yaw = approachAngle(p.yaw, input.aim, (len > 0.1 ? 14 : 9) * dt);
+    } else if (len > 0.1) {
+      p.yaw = approachAngle(p.yaw, Math.atan2(mx, mz), 12 * dt);
+    }
+  }
+  ctlState.mx = mx;
+  ctlState.mz = mz;
+  ctlState.stunned = stunned;
+  ctlState.diving = p.diveT > 0;
+  return ctlState;
+}
+
+/**
+ * Shared controls (both backends): dive, buffered jump with coyote time, and
+ * arcade horizontal acceleration / friction. Needs p.grounded and p.coyote
+ * to be current for this step.
+ */
+function applyCharacterControls(p, input, dt, C, ctl) {
+  const { mx, mz, stunned, diving } = ctl;
+  if (input && !stunned) {
+    if (input.jump) p.jumpBuffer = C.jumpBufferTime;
+    if (input.dive && !diving && p.diveCd <= 0 && (p.grounded || p.coyote > 0)) {
+      const fx = Math.sin(p.yaw);
+      const fz = Math.cos(p.yaw);
+      p.vx = fx * C.diveSpeed;
+      p.vz = fz * C.diveSpeed;
+      p.vy = C.diveUp;
+      p.diveT = C.diveTime;
+      p.diveCd = C.diveCooldown;
+      p.grounded = false;
+      p.coyote = 0;
+      p.jumpBuffer = 0;
+    }
+  }
+  if (p.jumpBuffer > 0) p.jumpBuffer = Math.max(0, p.jumpBuffer - dt);
+  if (p.jumpBuffer > 0 && (p.grounded || p.coyote > 0) && !diving && !stunned) {
+    p.vy = C.jumpSpeed;
+    p.grounded = false;
+    p.coyote = 0;
+    p.jumpBuffer = 0;
+  }
+
+  if (p.diveT > 0) {
+    p.diveT = Math.max(0, p.diveT - dt);
+    if (p.diveT === 0) p.getUpT = C.getUpTime;
+  }
+
+  // ---- horizontal movement ------------------------------------------------
+  const canSteer = !stunned && !diving;
+  const speedCap = input && input.sprint ? C.sprintSpeed : C.walkSpeed;
+  if (canSteer) {
+    const accel = p.grounded ? C.groundAccel : C.airAccel;
+    const targetX = mx * speedCap;
+    const targetZ = mz * speedCap;
+    p.vx += clamp(targetX - p.vx, -accel * dt, accel * dt);
+    p.vz += clamp(targetZ - p.vz, -accel * dt, accel * dt);
+    if (p.grounded && mx === 0 && mz === 0) {
+      const drop = C.groundFriction * dt;
+      const speed = length2(p.vx, p.vz);
+      const scale = speed > 0 ? Math.max(0, speed - drop) / speed : 0;
+      p.vx *= scale;
+      p.vz *= scale;
+    }
+  } else if (p.grounded) {
+    const drop = (diving ? 5 : 8) * dt;
+    const speed = length2(p.vx, p.vz);
+    const scale = speed > 0 ? Math.max(0, speed - drop) / speed : 0;
+    p.vx *= scale;
+    p.vz *= scale;
+  }
+}
+
+/**
+ * A hazard (spinning bar, sweeper, rolling ball) hits a player: carry its
+ * surface velocity — never less than a firm shove away from it — then knock
+ * the player over. `awayX/awayZ` (optional, unit) is the fallback direction
+ * when the surface itself is barely moving (near a spinner's hub).
+ */
+function knockFromHazard(p, m, svx, svz, awayX, awayZ) {
+  const kick = m.push ?? 1;
+  let vx = svx * kick;
+  let vz = svz * kick;
+  const minSpeed = 5 * kick;
+  if (awayX !== undefined && vx * vx + vz * vz < minSpeed * minSpeed) {
+    vx = awayX * minSpeed;
+    vz = awayZ * minSpeed;
+  }
+  p.vx = vx;
+  p.vz = vz;
+  p.vy = Math.max(p.vy, 3.5 * Math.min(2, kick));
+  p.stunT = Math.max(p.stunT, 0.9);
+  p.grounded = false;
+  if (m.damage) p.pendingHazardDamage = (p.pendingHazardDamage || 0) + m.damage;
+}
+
+/** Remove the velocity component pointing into a contact normal. */
+function cancelIntoNormal(p, nx, ny, nz) {
+  const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+  if (len < 1e-6) return;
+  nx /= len; ny /= len; nz /= len;
+  const dot = p.vx * nx + p.vy * ny + p.vz * nz;
+  if (dot >= 0) return;
+  p.vx -= nx * dot;
+  p.vy -= ny * dot;
+  p.vz -= nz * dot;
+}
+
+/**
+ * Player-vs-player jostle: equal-mass separation so a crowd funnelling
+ * through a doorway shoves instead of overlapping. Runs once per step over
+ * the whole roster (O(n) with the caller's spatial buckets). `move(p, dx, dz)`
+ * replaces the direct position change (the physics backend passes one).
+ */
+function resolvePlayerPush(a, b, dt, C = CHARACTER, move = null) {
+  const dx = b.x - a.x;
+  const dz = b.z - a.z;
+  const dy = b.y - a.y;
+  if (Math.abs(dy) > C.height * 0.9) return false;
+  const minDist = C.pushRadius * 2;
+  const d2 = dx * dx + dz * dz;
+  if (d2 > minDist * minDist) return false;
+  const d = Math.sqrt(d2) || 0.0001;
+  const overlap = (minDist - d) * 0.5;
+  const nx = dx / d;
+  const nz = dz / d;
+  if (move) {
+    // Physics backend: separate through the character controller, so a
+    // shove can never push someone into (or through) a wall.
+    move(a, -nx * overlap, -nz * overlap);
+    move(b, nx * overlap, nz * overlap);
+  } else {
+    a.x -= nx * overlap;
+    a.z -= nz * overlap;
+    b.x += nx * overlap;
+    b.z += nz * overlap;
+  }
+  const impulse = Math.min(overlap * C.pushStrength, 9) * dt * 30;
+  a.vx -= nx * impulse * dt;
+  a.vz -= nz * impulse * dt;
+  b.vx += nx * impulse * dt;
+  b.vz += nz * impulse * dt;
+  return true;
+}
+
+/**
  * World manifest → runtime world.
  *
  * A **manifest** is plain JSON describing a place: its solids (which are both
@@ -971,16 +1715,27 @@ function normalizeManifest(manifest) {
     pickups: manifest.pickups || [],
     checkpoints: manifest.checkpoints || [],
     zones: manifest.zones || [],
+    meshes: manifest.meshes || [],      // [{vertices:[x,y,z,…], indices:[…]}] — Rapier backend only
+    rollers: manifest.rollers || [],    // ball spawners — Rapier backend only
   };
   if (!m.spawns.length) throw new Error('world manifest needs at least one spawn point');
   m.movers.forEach((mv, i) => { if (!mv.id) mv.id = 'mv' + i; });
   m.pickups.forEach((pk, i) => { if (!pk.id) pk.id = 'pk' + i; });
   m.checkpoints.forEach((cp, i) => { if (!cp.id) cp.id = 'cp' + i; if (cp.order == null) cp.order = i; });
   m.zones.forEach((z, i) => { if (!z.id) z.id = 'zn' + i; });
+  m.rollers.forEach((r, i) => { if (!r.id) r.id = 'rl' + i; });
   return m;
 }
 
-function buildWorld(manifest) {
+/**
+ * @param {object} manifest
+ * @param {object} [options]
+ * @param {object} [options.rapier]  initialised RAPIER namespace → Rapier
+ *   physics backend (real meshes, character controller, rolling balls).
+ *   Without it the world uses the arcade box/ramp backend.
+ * @param {number} [options.dt]      fixed simulation step (Rapier backend)
+ */
+function buildWorld(manifest, options = {}) {
   const m = normalizeManifest(manifest);
   const collision = createCollisionWorld({
     solids: m.solids,
@@ -989,12 +1744,18 @@ function buildWorld(manifest) {
   });
   const movers = m.movers.map(createMover);
   updateMovers(movers, 0);
+  const moverById = new Map(movers.map(mv => [mv.id, mv]));
+  const physics = options.rapier
+    ? createPhysics(options.rapier, m, movers, { character: CHARACTER, dt: options.dt, gravity: manifest.gravity })
+    : null;
   const checkpoints = m.checkpoints.slice().sort((a, b) => a.order - b.order);
 
   return {
     manifest: m,
     collision,
     movers,
+    moverById,
+    physics,
     checkpoints,
     zones: m.zones,
     spawns: m.spawns,
@@ -1002,8 +1763,17 @@ function buildWorld(manifest) {
     pickups: m.pickups,
     bounds: m.bounds,
     killY: m.killY,
-    /** Advance hazards to world time `t` (seconds). */
-    update(t) { updateMovers(movers, t); },
+    /**
+     * Advance hazards to world time `t` (seconds). Pure function of `t`, so a
+     * phone replaying history can jump back and forth freely. With physics,
+     * the new poses are visible to queries after the next physics step.
+     */
+    update(t) {
+      updateMovers(movers, t);
+      if (physics) physics.syncMovers();
+    },
+    /** Release native physics memory (Rapier backend). */
+    dispose() { if (physics) physics.free(); },
     /** Spawn point chosen to be as far as possible from the given entities. */
     pickSpawn(avoid, tag, rng) {
       const pool = tag ? m.spawns.filter(s => s.tag === tag) : m.spawns;
@@ -1080,325 +1850,102 @@ function createRng(seed = 1) {
 }
 
 /**
- * On-foot character controller.
+ * Rollers — balls that spawn on a schedule and tumble down the level
+ * (Rapier backend only, simulated on the server and interpolated on phones).
  *
- * The feel is deliberately arcade — Fall Guys, not a milsim: quick
- * acceleration, generous air control, a committed dive, and players who bump
- * and jostle each other instead of passing through. It is also deterministic
- * and allocation-free, because the client runs this exact function to predict
- * the local player while the server runs it as the authority.
+ * Spec (from the world manifest):
+ *   { id, x, y, z, radius?, every?, first?, life?, max?, vx?, vy?, vz? }
+ *     every  — seconds between balls (default 3)
+ *     first  — world time of the first ball (default 0)
+ *     life   — seconds before a ball is removed (default 12)
+ *     max    — cap on live balls from this spawner (default 6)
+ *     v*     — launch velocity
  *
- * Positions are FEET positions (`y` is ground height, not the capsule centre).
+ * Spawning is a pure function of world time, so a restarted room produces
+ * the same balls at the same moments.
  */
 
-const CHARACTER = {
-  radius: 0.4,
-  height: 1.8,
-  eyeHeight: 1.6,
-  walkSpeed: 5.6,
-  sprintSpeed: 8.6,
-  groundAccel: 48,
-  airAccel: 14,
-  groundFriction: 11,
-  airDrag: 0.25,
-  gravity: 24,
-  jumpSpeed: 9.2,
-  coyoteTime: 0.12,
-  jumpBufferTime: 0.15,
-  stepHeight: 0.55,
-  maxSlopeNormalY: 0.64,     // ≈ 50°: steeper than this and you slide
-  slideAccel: 16,
-  diveSpeed: 10.5,
-  diveUp: 3.6,
-  diveTime: 0.55,
-  getUpTime: 0.4,
-  diveCooldown: 0.9,
-  pushRadius: 0.62,          // player-vs-player jostle radius
-  pushStrength: 26,
-  maxFallSpeed: 45,
-  fallDamageSpeed: 22,       // impact speed where fall damage starts
-  fallDamagePerSpeed: 4.5,
-};
+function createRollers(world) {
+  const physics = world.physics;
+  const spawners = (world.manifest.rollers || []).map((spec) => ({
+    spec,
+    every: Math.max(0.25, spec.every ?? 3),
+    first: spec.first ?? 0,
+    life: spec.life ?? 12,
+    max: spec.max ?? 6,
+    radius: spec.radius ?? 1.2,
+    lastIndex: -1,
+    live: [],          // [{id, until}]
+  }));
 
-const push$1 = { x: 0, y: 0, z: 0, hit: false, mover: null, vx: 0, vy: 0, vz: 0 };
-
-/** Reset a player to a spawn point, on foot and fully healed. */
-function spawnCharacter(p, spawn) {
-  p.x = spawn.x; p.y = spawn.y; p.z = spawn.z;
-  p.vx = 0; p.vy = 0; p.vz = 0;
-  p.yaw = spawn.yaw || 0;
-  p.grounded = true;
-  p.coyote = 0;
-  p.jumpBuffer = 0;
-  p.diveT = 0;
-  p.diveCd = 0;
-  p.stunT = 0;
-  p.getUpT = 0;
-  p.anim = 'idle';
-  p.veh = null;
-  p.seat = -1;
-  return p;
-}
-
-/** Knock a player about — car hits, explosions, spinner bars, shoves. */
-function applyImpulse(p, ix, iy, iz, stun = 0) {
-  p.vx += ix;
-  p.vy += iy;
-  p.vz += iz;
-  if (stun > 0) {
-    p.stunT = Math.max(p.stunT || 0, stun);
-    p.diveT = 0;
-    p.grounded = false;
-  }
-}
-
-/**
- * Advance one on-foot player by `dt`.
- *
- * @param {object} p      player entity (mutated in place)
- * @param {object} input  {mx, mz, aim, jump, sprint, dive}
- * @param {number} dt     seconds
- * @param {object} ctx    {collision, movers, gravity?, config?}
- */
-function stepCharacter(p, input, dt, ctx) {
-  const C = ctx.config || CHARACTER;
-  const collision = ctx.collision;
-  const movers = ctx.movers || [];
-
-  if (p.stunT > 0) p.stunT = Math.max(0, p.stunT - dt);
-  if (p.diveCd > 0) p.diveCd = Math.max(0, p.diveCd - dt);
-  if (p.getUpT > 0) p.getUpT = Math.max(0, p.getUpT - dt);
-
-  const stunned = p.stunT > 0 || p.getUpT > 0;
-  const diving = p.diveT > 0;
-  let mx = 0;
-  let mz = 0;
-
-  if (input && !stunned) {
-    mx = input.mx || 0;
-    mz = input.mz || 0;
-    const len = length2(mx, mz);
-    if (len > 1) { mx /= len; mz /= len; }
-    if (typeof input.aim === 'number') {
-      // Facing follows the aim/camera yaw; it snaps faster while moving.
-      p.yaw = approachAngle(p.yaw, input.aim, (len > 0.1 ? 14 : 9) * dt);
-    } else if (len > 0.1) {
-      p.yaw = approachAngle(p.yaw, Math.atan2(mx, mz), 12 * dt);
+  function preStep(sim) {
+    const t = sim.state.t;
+    for (const sp of spawners) {
+      if (t < sp.first) continue;
+      const index = Math.floor((t - sp.first) / sp.every);
+      if (index <= sp.lastIndex) continue;
+      sp.lastIndex = index;
+      if (sp.live.length >= sp.max) continue;
+      const s = sp.spec;
+      const id = s.id + '_' + index;
+      physics.addRoller(id, s.x, s.y ?? 0, s.z, sp.radius, s.vx || 0, s.vy || 0, s.vz || 0);
+      sp.live.push({ id, until: t + sp.life });
+      sim.emit({ e: 'roll', id, x: q(s.x), y: q(s.z) });
     }
   }
 
-  // ---- ground probe -------------------------------------------------------
-  const feetProbe = p.y + 0.25;
-  const ground = collision.sampleGround(p.x, p.z, feetProbe, C.radius * 0.9);
-  const moverGround = sampleMoverGround(movers, p.x, p.z, feetProbe, C.radius * 0.9);
-  let groundY = ground.y;
-  let groundNormalY = ground.normalY;
-  let rider = null;
-  if (moverGround.mover && moverGround.y >= groundY) {
-    groundY = moverGround.y;
-    groundNormalY = 1;
-    rider = moverGround.mover;
-  }
-
-  const wasGrounded = p.grounded;
-  const nearGround = groundY > -Infinity && p.y <= groundY + 0.08 && p.vy <= 0.001;
-  const steep = groundNormalY < C.maxSlopeNormalY;
-  p.grounded = nearGround && !steep;
-  if (p.grounded) {
-    p.coyote = C.coyoteTime;
-  } else if (p.coyote > 0) {
-    p.coyote = Math.max(0, p.coyote - dt);
-  }
-
-  const impactSpeed = wasGrounded ? 0 : -p.vy;
-
-  // ---- dive / jump --------------------------------------------------------
-  if (input && !stunned) {
-    if (input.jump) p.jumpBuffer = C.jumpBufferTime;
-    if (input.dive && !diving && p.diveCd <= 0 && (p.grounded || p.coyote > 0)) {
-      const fx = Math.sin(p.yaw);
-      const fz = Math.cos(p.yaw);
-      p.vx = fx * C.diveSpeed;
-      p.vz = fz * C.diveSpeed;
-      p.vy = C.diveUp;
-      p.diveT = C.diveTime;
-      p.diveCd = C.diveCooldown;
-      p.grounded = false;
-      p.coyote = 0;
-      p.jumpBuffer = 0;
-    }
-  }
-  if (p.jumpBuffer > 0) p.jumpBuffer = Math.max(0, p.jumpBuffer - dt);
-  if (p.jumpBuffer > 0 && (p.grounded || p.coyote > 0) && !diving && !stunned) {
-    p.vy = C.jumpSpeed;
-    p.grounded = false;
-    p.coyote = 0;
-    p.jumpBuffer = 0;
-  }
-
-  if (p.diveT > 0) {
-    p.diveT = Math.max(0, p.diveT - dt);
-    if (p.diveT === 0) p.getUpT = C.getUpTime;
-  }
-
-  // ---- horizontal movement ------------------------------------------------
-  const canSteer = !stunned && !diving;
-  const speedCap = input && input.sprint ? C.sprintSpeed : C.walkSpeed;
-  if (canSteer) {
-    const accel = p.grounded ? C.groundAccel : C.airAccel;
-    const targetX = mx * speedCap;
-    const targetZ = mz * speedCap;
-    p.vx += clamp(targetX - p.vx, -accel * dt, accel * dt);
-    p.vz += clamp(targetZ - p.vz, -accel * dt, accel * dt);
-    if (p.grounded && mx === 0 && mz === 0) {
-      const drop = C.groundFriction * dt;
-      const speed = length2(p.vx, p.vz);
-      const scale = speed > 0 ? Math.max(0, speed - drop) / speed : 0;
-      p.vx *= scale;
-      p.vz *= scale;
-    }
-  } else if (p.grounded) {
-    const drop = (diving ? 5 : 8) * dt;
-    const speed = length2(p.vx, p.vz);
-    const scale = speed > 0 ? Math.max(0, speed - drop) / speed : 0;
-    p.vx *= scale;
-    p.vz *= scale;
-  }
-
-  // ---- gravity / slopes ---------------------------------------------------
-  if (p.grounded) {
-    if (p.vy < 0) p.vy = 0;
-  } else {
-    p.vy -= C.gravity * dt;
-    if (p.vy < -C.maxFallSpeed) p.vy = -C.maxFallSpeed;
-  }
-  if (nearGround && steep) {
-    p.vx += ground.slopeX * C.slideAccel * dt;
-    p.vz += ground.slopeZ * C.slideAccel * dt;
-  }
-  if (rider) {
-    // Ride the platform: carry its motion without fighting the ground snap.
-    p.x += rider.vx * dt;
-    p.z += rider.vz * dt;
-    if (rider.vy > 0) p.y += rider.vy * dt;
-  }
-
-  // ---- integrate ----------------------------------------------------------
-  p.x += p.vx * dt;
-  p.y += p.vy * dt;
-  p.z += p.vz * dt;
-
-  // ---- static + mover collision ------------------------------------------
-  // Only the UPPER body is resolved against solids: anything below the step
-  // height is the ground probe's job. Sampling a sphere at ankle level fights
-  // the ground snap on every ramp and kerb, which reads as walking through
-  // treacle up a slope.
-  const r = C.radius;
-  const heights = diving
-    ? [r + 0.1, r * 2]
-    : [C.stepHeight + r * 0.5, C.height * 0.55, C.height - r];
-  for (let i = 0; i < heights.length; i++) {
-    const cy = p.y + heights[i];
-    const fix = collision.resolveSphere(p.x, cy, p.z, r);
-    if (fix.hit) {
-      p.x += fix.x;
-      p.z += fix.z;
-      if (fix.y > 0 && p.vy < 0) { p.y += fix.y; p.vy = 0; }
-      else if (fix.y < 0 && p.vy > 0) { p.y += fix.y; p.vy = 0; }
-      cancelIntoNormal(p, fix.x, 0, fix.z);
-    }
-    if (movers.length) {
-      resolveMovers(movers, p.x, p.y + heights[i], p.z, r, push$1);
-      if (push$1.hit) {
-        p.x += push$1.x;
-        p.z += push$1.z;
-        if (push$1.y !== 0) p.y += push$1.y;
-        const m = push$1.mover;
-        if (m && !m.rideable) {
-          // Hazard bar: transfer its surface velocity, then knock you down.
-          const kick = m.push;
-          p.vx = push$1.vx * kick;
-          p.vz = push$1.vz * kick;
-          p.vy = Math.max(p.vy, 3.5 * Math.min(2, kick));
-          p.stunT = Math.max(p.stunT, 0.9);
-          p.grounded = false;
-          if (m.damage) p.pendingHazardDamage = (p.pendingHazardDamage || 0) + m.damage;
-        } else {
-          cancelIntoNormal(p, push$1.x, 0, push$1.z);
-        }
+  function postStep(sim) {
+    const t = sim.state.t;
+    const killY = world.killY;
+    for (const sp of spawners) {
+      for (let i = sp.live.length - 1; i >= 0; i--) {
+        const ball = sp.live[i];
+        const roller = physics.rollers.get(ball.id);
+        const y = roller ? roller.body.translation().y : -Infinity;
+        if (t < ball.until && y > killY) continue;
+        physics.removeRoller(ball.id);
+        sp.live.splice(i, 1);
       }
     }
   }
 
-  // ---- ground snap + step up ---------------------------------------------
-  const after = collision.sampleGround(p.x, p.z, p.y + (p.grounded ? C.stepHeight : 0.08), C.radius * 0.9);
-  const afterMover = sampleMoverGround(movers, p.x, p.z, p.y + (p.grounded ? C.stepHeight : 0.15), C.radius * 0.9);
-  let snapY = after.y;
-  if (afterMover.mover && afterMover.y > snapY) snapY = afterMover.y;
-  if (snapY > -Infinity) {
-    if (p.y < snapY) {
-      p.y = snapY;
-      if (p.vy < 0) p.vy = 0;
-      p.grounded = after.normalY >= C.maxSlopeNormalY || afterMover.mover != null;
-      // Landing is detected HERE, not before integration: at terminal velocity
-      // a body covers 1.5 m per tick and would never be seen "near" the floor.
-      if (impactSpeed > C.fallDamageSpeed) {
-        p.pendingFallDamage = Math.round((impactSpeed - C.fallDamageSpeed) * C.fallDamagePerSpeed);
-      }
-    } else if (p.grounded && p.y - snapY < 0.2) {
-      p.y = snapY;
+  /** Project live balls as network entities: k 'o', x/y on the ground plane, h height. */
+  function project(out) {
+    for (const roller of physics.rollers.values()) {
+      const p = roller.body.translation();
+      out[roller.id] = { k: 'o', x: q(p.x), y: q(p.z), h: q(p.y), r: roller.r };
     }
   }
 
-  p.yaw = wrapAngle(p.yaw);
-  p.anim = p.stunT > 0 ? 'stun'
-    : p.diveT > 0 ? 'dive'
-      : p.getUpT > 0 ? 'getup'
-        : !p.grounded ? 'air'
-          : length2(p.vx, p.vz) > 0.6 ? (input && input.sprint ? 'sprint' : 'run')
-            : 'idle';
-  return p;
-}
-
-/** Remove the velocity component pointing into a contact normal. */
-function cancelIntoNormal(p, nx, ny, nz) {
-  const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
-  if (len < 1e-6) return;
-  nx /= len; ny /= len; nz /= len;
-  const dot = p.vx * nx + p.vy * ny + p.vz * nz;
-  if (dot >= 0) return;
-  p.vx -= nx * dot;
-  p.vy -= ny * dot;
-  p.vz -= nz * dot;
+  return { preStep, postStep, project, spawners };
 }
 
 /**
- * Player-vs-player jostle: equal-mass separation so a crowd funnelling
- * through a doorway shoves instead of overlapping. Runs once per step over
- * the whole roster (O(n) with the caller's spatial buckets).
+ * Input normalisation shared by the server and the phone.
+ *
+ * The server clamps every raw client input with this before simulating it,
+ * and the phone runs the SAME function on what it sends, so a predicted tick
+ * and the server's tick see bit-identical input.
  */
-function resolvePlayerPush(a, b, dt, C = CHARACTER) {
-  const dx = b.x - a.x;
-  const dz = b.z - a.z;
-  const dy = b.y - a.y;
-  if (Math.abs(dy) > C.height * 0.9) return false;
-  const minDist = C.pushRadius * 2;
-  const d2 = dx * dx + dz * dz;
-  if (d2 > minDist * minDist) return false;
-  const d = Math.sqrt(d2) || 0.0001;
-  const overlap = (minDist - d) * 0.5;
-  const nx = dx / d;
-  const nz = dz / d;
-  a.x -= nx * overlap;
-  a.z -= nz * overlap;
-  b.x += nx * overlap;
-  b.z += nz * overlap;
-  const impulse = Math.min(overlap * C.pushStrength, 9) * dt * 30;
-  a.vx -= nx * impulse * dt;
-  a.vz -= nz * impulse * dt;
-  b.vx += nx * impulse * dt;
-  b.vz += nz * impulse * dt;
-  return true;
+
+/** Clamp one raw input into `out` (allocation-free when `out` is reused). */
+function normalizeInput(raw, out = {}) {
+  out.mx = clamp(Number(raw.mx) || 0, -1, 1);
+  out.mz = clamp(Number(raw.mz) || 0, -1, 1);
+  out.aim = Number.isFinite(raw.aim) ? wrapAngle(Number(raw.aim)) : undefined;
+  out.jump = !!raw.jump;
+  out.sprint = !!raw.sprint;
+  out.dive = !!raw.dive;
+  out.throttle = clamp(Number(raw.throttle) || 0, -1, 1);
+  out.steer = clamp(Number(raw.steer) || 0, -1, 1);
+  out.handbrake = !!raw.handbrake;
+  out.fire = !!raw.fire;
+  out.aimX = Number(raw.aimX) || 0;
+  out.aimY = Number(raw.aimY) || 0;
+  out.aimZ = Number(raw.aimZ) || 0;
+  out.use = !!raw.use;
+  out.weapon = typeof raw.weapon === 'string' ? raw.weapon.slice(0, 32) : undefined;
+  return out;
 }
 
 /**
@@ -1887,6 +2434,7 @@ function traceShot(ctx, shooterId, ox, oy, oz, dx, dy, dz, maxT) {
   const vehicles = ctx.vehicles || [];
   for (let i = 0; i < vehicles.length; i++) {
     const v = vehicles[i];
+    if (v.id === ctx.ignoreVehicle) continue;
     const t = rayVehicle(v, ox, oy, oz, dx, dy, dz, bestT);
     if (t < 0 || t >= bestT) continue;
     bestT = t;
@@ -1981,6 +2529,7 @@ const SIM_DEFAULTS = {
   maxProjectiles: 120,
   pickupRespawn: 20,
   eventBudget: 60,           // per-tick cap on broadcast events
+  maxInputQueue: 6,          // buffered inputs per player (~200 ms at 30 Hz)
 };
 
 const ZERO_INPUT = { mx: 0, mz: 0, aim: undefined, jump: false, sprint: false, dive: false };
@@ -1990,8 +2539,10 @@ const tmpAim = { x: 0, y: 0, z: 0 };
 
 function createSimulation(options) {
   const world = options.world;
-  const config = { ...SIM_DEFAULTS, ...(options.config || {}) };
   const mode = options.mode || null;
+  // Mode settings (e.g. deathmatch start weapons) sit between the engine
+  // defaults and whatever the server explicitly passes.
+  const config = { ...SIM_DEFAULTS, ...((mode && mode.config) || {}), ...(options.config || {}) };
   const rng = options.rng || createRng(options.seed ?? 12345);
 
   const state = {
@@ -2008,7 +2559,10 @@ function createSimulation(options) {
   let nextProjectileId = 1;
   const playerList = [];
   const vehicleList = [];
-  const traceCtx = { collision: world.collision, players: playerList, vehicles: vehicleList };
+  const traceCtx = { collision: world.collision, players: playerList, vehicles: vehicleList, ignoreVehicle: null };
+  const charCtx = { collision: world.collision, movers: world.movers, physics: world.physics, moverById: world.moverById };
+  const rollers = world.physics ? createRollers(world) : null;
+  const pushMove = world.physics ? (p, dx, dz) => world.physics.moveCharacter(p, dx, 0, dz) : null;
 
   // Parked vehicles come from the manifest and live for the world's lifetime.
   (world.vehicleSpawns || []).forEach((vs, i) => {
@@ -2048,6 +2602,8 @@ function createSimulation(options) {
       joinedAt: state.t,
       lastSeq: 0,
       input: { ...ZERO_INPUT },
+      inputQueue: [],
+      teleports: 0,
       firing: false,
       pendingFallDamage: 0,
       pendingHazardDamage: 0,
@@ -2069,37 +2625,70 @@ function createSimulation(options) {
     if (!p) return;
     leaveVehicle(p, true);
     delete state.players[id];
+    if (world.physics) world.physics.removeCharacter(id);
     refreshLists();
     if (mode && mode.onLeave) mode.onLeave(api, p);
   }
 
   /**
-   * Latest input wins — this is a realtime stream, not a command queue.
+   * Inputs that carry a `seq` (real clients) are QUEUED and consumed one per
+   * tick, so the server replays exactly what the phone predicted and the ack
+   * means "applied". Inputs without a seq (bots, tests) apply immediately.
    * Everything is clamped here so the rest of the sim can trust it.
    */
   function setInput(id, raw) {
     const p = state.players[id];
     if (!p || !raw) return;
-    const input = p.input;
-    input.mx = clamp(Number(raw.mx) || 0, -1, 1);
-    input.mz = clamp(Number(raw.mz) || 0, -1, 1);
-    input.aim = Number.isFinite(raw.aim) ? wrapAngle(Number(raw.aim)) : undefined;
-    input.jump = !!raw.jump;
-    input.sprint = !!raw.sprint;
-    input.dive = !!raw.dive;
-    input.throttle = clamp(Number(raw.throttle) || 0, -1, 1);
-    input.steer = clamp(Number(raw.steer) || 0, -1, 1);
-    input.handbrake = !!raw.handbrake;
-    input.fire = !!raw.fire;
-    input.aimX = Number(raw.aimX) || 0;
-    input.aimY = Number(raw.aimY) || 0;
-    input.aimZ = Number(raw.aimZ) || 0;
-    if (Number.isFinite(raw.seq)) p.lastSeq = Math.max(p.lastSeq, raw.seq | 0);
+    if (!Number.isFinite(raw.seq)) { applyInput(p, normalizeInput(raw, p.input)); return; }
+    const seq = raw.seq | 0;
+    const queue = p.inputQueue;
+    const newest = queue.length ? queue[queue.length - 1].seq : p.lastSeq;
+    if (seq <= newest) return;                        // duplicate or out of order
+    const entry = normalizeInput(raw, {});
+    entry.seq = seq;
+    queue.push(entry);
+    // A client whose clock runs fast would build latency forever: drop the
+    // oldest so we stay within ~maxInputQueue ticks of what it is doing now.
+    while (queue.length > config.maxInputQueue) queue.shift();
+  }
 
-    if (raw.use && !p.useHeld) { p.useHeld = true; toggleVehicle(p); }
-    else if (!raw.use) p.useHeld = false;
+  /** Pop this tick's input (or keep holding the last one if none arrived). */
+  function consumeInput(p) {
+    const next = p.inputQueue.length ? p.inputQueue.shift() : null;
+    if (!next) return;
+    Object.assign(p.input, next);
+    p.lastSeq = next.seq;
+    applyInput(p, p.input);
+  }
 
-    if (raw.weapon && p.weapons && p.weapons.indexOf(raw.weapon) !== -1) p.weapon = raw.weapon;
+  function applyInput(p, input) {
+    if (input.use && !p.useHeld) { p.useHeld = true; toggleVehicle(p); }
+    else if (!input.use) p.useHeld = false;
+    if (input.weapon && p.weapons && p.weapons.indexOf(input.weapon) !== -1) p.weapon = input.weapon;
+  }
+
+  /** Drop any buffered input (disconnects): the player stops instead of replaying stale keys. */
+  function clearInput(id) {
+    const p = state.players[id];
+    if (!p) return;
+    p.inputQueue.length = 0;
+    normalizeInput({}, p.input);
+  }
+
+  /**
+   * Move a player somewhere new (start grids, round resets): out of any
+   * vehicle, at rest, with every movement timer cleared. Bumps `teleports`
+   * so the owner's prediction snaps instead of smoothing across the jump.
+   */
+  function teleportPlayer(p, spot) {
+    leaveVehicle(p, true);
+    p.x = spot.x; p.y = spot.y ?? 0; p.z = spot.z;
+    p.yaw = spot.yaw || 0;
+    p.vx = 0; p.vy = 0; p.vz = 0;
+    p.stunT = 0; p.diveT = 0; p.getUpT = 0; p.jumpBuffer = 0; p.coyote = 0;
+    p.grounded = true;
+    p.rideId = null;
+    p.teleports = (p.teleports || 0) + 1;
   }
 
   function damagePlayer(p, amount, sourceId, cause) {
@@ -2167,7 +2756,13 @@ function createSimulation(options) {
     }
     if (!best) return;
     if (!best.driver) { best.driver = p.id; p.seat = 0; }
-    else { best.passengers.push(p.id); p.seat = 1 + best.passengers.length; }
+    else {
+      // First free passenger seat (seats are 1…n-1; people leave out of order).
+      let seat = 1;
+      while (best.passengers.some(id => state.players[id] && state.players[id].seat === seat)) seat += 1;
+      best.passengers.push(p.id);
+      p.seat = seat;
+    }
     p.veh = best.id;
     p.vx = 0; p.vy = 0; p.vz = 0;
     best.lastDriver = best.driver;
@@ -2211,6 +2806,7 @@ function createSimulation(options) {
     }
 
     muzzleOf(p, tmpMuzzle);
+    traceCtx.ignoreVehicle = p.veh || null;      // never hit the car you are firing from
     normalizeAim(p, p.input.aimX, p.input.aimY, p.input.aimZ, tmpAim);
     if (p.veh) {
       const v = state.vehicles[p.veh];
@@ -2342,10 +2938,13 @@ function createSimulation(options) {
     state.t += dt;
     state.tick += 1;
     world.update(state.t);
+    if (rollers) rollers.preStep(api, dt);
+    if (world.physics) world.physics.step();
 
     if (mode && mode.preTick) mode.preTick(api, dt);
 
     // --- players
+    for (let i = 0; i < playerList.length; i++) consumeInput(playerList[i]);
     for (let i = 0; i < playerList.length; i++) {
       const p = playerList[i];
       if (p.hp <= 0) {
@@ -2363,7 +2962,7 @@ function createSimulation(options) {
           p.vx = v.vx; p.vy = v.vy; p.vz = v.vz;
         }
       } else {
-        stepCharacter(p, p.input, dt, { collision: world.collision, movers: world.movers });
+        stepCharacter(p, p.input, dt, charCtx);
         if (config.fallDamage && p.pendingFallDamage) {
           const dmg = p.pendingFallDamage;
           p.pendingFallDamage = 0;
@@ -2390,7 +2989,7 @@ function createSimulation(options) {
         const b = playerList[j];
         if (b.hp <= 0 || b.veh) continue;
         if (Math.abs(a.x - b.x) > 2 || Math.abs(a.z - b.z) > 2) continue;
-        resolvePlayerPush(a, b, dt);
+        resolvePlayerPush(a, b, dt, CHARACTER, pushMove);
       }
     }
 
@@ -2447,7 +3046,9 @@ function createSimulation(options) {
     }
 
     // --- projectiles
+    traceCtx.ignoreVehicle = null;
     if (state.projectiles.length) stepProjectiles(state, dt, traceCtx, onProjectileHit);
+    if (rollers) rollers.postStep(api, dt);
 
     // --- pickups
     if (world.pickups.length) {
@@ -2558,6 +3159,7 @@ function createSimulation(options) {
       const b = state.projectiles[i];
       out[b.id] = { k: 'b', x: q(b.x), y: q(b.z), h: q(b.y), t: b.weapon };
     }
+    if (rollers) rollers.project(out);
     for (let i = 0; i < world.pickups.length; i++) {
       const spec = world.pickups[i];
       if (!state.pickups[spec.id].ready) continue;
@@ -2582,6 +3184,23 @@ function createSimulation(options) {
     return g;
   }
 
+  /**
+   * Everything the OWNER needs to replay its own prediction: exact (not
+   * quantized) position and velocity plus every movement timer, stamped with
+   * the world time of the tick that consumed input `ak`. Sent only to that
+   * player — nobody else needs it.
+   */
+  function projectSelf(id) {
+    const p = state.players[id];
+    if (!p) return null;
+    return {
+      t: state.t, ak: p.lastSeq, tp: p.teleports || 0,
+      x: p.x, y: p.y, z: p.z, vx: p.vx, vy: p.vy, vz: p.vz, yaw: p.yaw,
+      g: p.grounded ? 1 : 0, co: p.coyote, jb: p.jumpBuffer,
+      dv: p.diveT, dc: p.diveCd, st: p.stunT, gu: p.getUpT, rd: p.rideId || null,
+    };
+  }
+
   function drainEvents() {
     const out = events;
     events = [];
@@ -2602,6 +3221,9 @@ function createSimulation(options) {
     step,
     projectEntities,
     projectGlobal,
+    projectSelf,
+    clearInput,
+    teleportPlayer,
     drainEvents,
     emit,
     damagePlayer,
@@ -2614,6 +3236,7 @@ function createSimulation(options) {
     leaveVehicle,
     getPlayer: (id) => state.players[id],
     getVehicle: (id) => state.vehicles[id],
+    get rollers() { return rollers; },
     spawnVehicle(id, kind, x, y, z, yaw) {
       const v = createVehicle(id, kind, x, y, z, yaw);
       state.vehicles[id] = v;
@@ -2742,6 +3365,9 @@ function createInterestGrid(options = {}) {
  */
 
 const KEYFRAME_MIN_INTERVAL_MS = 1000;
+const MAX_CATCH_UP_STEPS = 5;          // after a stall, run at most this many ticks at once
+const DEFAULT_GRACE_MS = 15_000;       // matches the platform's reconnect grace
+const DEFAULT_MAX_ENTITIES = 96;       // per-observer cap: the nearest N are sent
 
 class WorldRoom {
   /**
@@ -2755,6 +3381,9 @@ class WorldRoom {
    * @param {number} [opts.snapshotHz=15]
    * @param {number} [opts.aoiRadius=140]
    * @param {number} [opts.maxPlayers=200]
+   * @param {object} [opts.rapier]      initialised RAPIER → Rapier physics backend
+   * @param {number} [opts.graceMs=15000] how long a dropped player keeps their place
+   * @param {number} [opts.maxEntities=96] per-observer entity cap
    */
   constructor(opts) {
     this.roomId = opts.roomId;
@@ -2764,7 +3393,10 @@ class WorldRoom {
     this.snapshotHz = opts.snapshotHz ?? 15;
     this.aoiRadius = opts.aoiRadius ?? 140;
     this.maxPlayers = opts.maxPlayers ?? 200;
-    this.world = buildWorld(opts.manifest);
+    this.graceMs = opts.graceMs ?? DEFAULT_GRACE_MS;
+    this.maxEntities = opts.maxEntities ?? DEFAULT_MAX_ENTITIES;
+    this._dt = 1 / this.tickHz;
+    this.world = buildWorld(opts.manifest, { rapier: opts.rapier, dt: this._dt });
     this.sim = createSimulation({
       world: this.world,
       mode: opts.mode,
@@ -2781,14 +3413,15 @@ class WorldRoom {
     this._pendingRemoved = new Set();
     this._tickCount = 0;
     this._lastTickAt = Date.now();
+    this._acc = 0;
     this._ticksPerSnapshot = Math.max(1, Math.round(this.tickHz / this.snapshotHz));
-    this._maxDt = 0.25;
     const tickMs = Math.round(1000 / this.tickHz);
     this._tickTimer = setInterval(() => this._tick(), tickMs);
     this._tickTimer.unref?.();
   }
 
   get playerIds() { return Array.from(this.players.keys()); }
+  /** Everyone holding a place, including players inside their reconnect grace. */
   get playerCount() { return this.players.size; }
 
   /** Admit (or re-attach) an authenticated player. */
@@ -2804,8 +3437,12 @@ class WorldRoom {
       }
       existing.ws = ws;
       existing.sessionId = sessionId;
+      existing.disconnectedAt = 0;
+      existing.sent = new Map();             // the keyframe below resets their view
     } else {
-      this.players.set(userId, { id: userId, name, sessionId, ws, lastKeyframeAt: 0 });
+      this.players.set(userId, {
+        id: userId, name, sessionId, ws, lastKeyframeAt: 0, disconnectedAt: 0, sent: new Map(),
+      });
       const p = this.sim.addPlayer(userId, name);
       this.grid.upsert(userId, p.x, p.z);
     }
@@ -2828,6 +3465,7 @@ class WorldRoom {
       mode: this.sim.mode ? { id: this.sim.mode.id, name: this.sim.mode.name } : null,
       sim_hz: this.tickHz,
       snapshot_hz: this.snapshotHz,
+      physics: this.world.physics ? 'rapier' : 'arcade',
       aoi_radius: this.aoiRadius,
     });
     sendFrame(ws, 'state_snapshot', this._buildKeyframe(userId));
@@ -2842,11 +3480,29 @@ class WorldRoom {
     return { ok: true, reconnect: !!existing };
   }
 
+  /**
+   * A socket dropped. Keep the player's place (and body, standing still) for
+   * `graceMs` so a phone blinking between networks lands back in the same
+   * spot with the same progress; remove only if they never come back.
+   */
+  disconnectPlayer(userId, expectedWs) {
+    const player = this.players.get(userId);
+    if (!player) return false;
+    if (expectedWs && player.ws !== expectedWs) return false;
+    if (this.graceMs <= 0) return this.removePlayer(userId, expectedWs, 'disconnected');
+    player.ws = null;
+    player.disconnectedAt = Date.now();
+    this.sim.clearInput(userId);
+    this.log('info', 'player disconnected (grace)', { room: this.roomId, user: userId, grace_ms: this.graceMs });
+    return true;
+  }
+
   removePlayer(userId, expectedWs, reason) {
     const player = this.players.get(userId);
     if (!player) return false;
     if (expectedWs && player.ws !== expectedWs) return false;
     this.players.delete(userId);
+    for (const other of this.players.values()) other.sent.delete(userId);
     this.sim.removePlayer(userId);
     this.grid.remove(userId);
     this.grid.dropObserver(userId);
@@ -2888,19 +3544,41 @@ class WorldRoom {
       try { player.ws?.close(code, reason); } catch { /* gone */ }
     }
     this.players.clear();
+    this.world.dispose();
   }
 
   // ── internals ──────────────────────────────────────────────────────────
 
+  /**
+   * Fixed-step loop. Timers fire late and unevenly, so real time accumulates
+   * and the simulation always advances in exact 1/tickHz steps — the same
+   * steps a phone replays when it predicts. After a long stall we catch up a
+   * few ticks and drop the rest rather than spiralling.
+   */
   _tick() {
     const now = Date.now();
-    const dt = Math.min(this._maxDt, Math.max(0, (now - this._lastTickAt) / 1000) || (1 / this.tickHz));
+    this._acc += Math.max(0, now - this._lastTickAt) / 1000;
     this._lastTickAt = now;
+    let steps = 0;
+    let snapshotDue = false;
+    while (this._acc >= this._dt && steps < MAX_CATCH_UP_STEPS) {
+      this.sim.step(this._dt);
+      this._acc -= this._dt;
+      steps += 1;
+      this._tickCount += 1;
+      if (this._tickCount % this._ticksPerSnapshot === 0) snapshotDue = true;
+    }
+    if (steps === MAX_CATCH_UP_STEPS && this._acc >= this._dt) this._acc = 0;
+    if (snapshotDue) this._snapshotPhase(now);
+    this._sweepGrace(now);
+  }
 
-    this.sim.step(dt);
-
-    this._tickCount += 1;
-    if (this._tickCount % this._ticksPerSnapshot === 0) this._snapshotPhase(now);
+  _sweepGrace(now) {
+    for (const player of this.players.values()) {
+      if (player.disconnectedAt && now - player.disconnectedAt > this.graceMs) {
+        this.removePlayer(player.id, null, 'timeout');
+      }
+    }
   }
 
   _snapshotPhase(now) {
@@ -2926,16 +3604,25 @@ class WorldRoom {
     for (const player of this.players.values()) {
       if (!player.ws || player.ws.readyState !== 1) continue;
       const self = this.sim.getPlayer(player.id);
-      const slice = { world: global };
+      let visibleIds = [];
       let removed = removedIds ? removedIds.slice() : [];
       if (self) {
         const { left, visible } = this.grid.observe(player.id, self.x, self.z, this.aoiRadius);
-        for (const id of visible) {
-          const e = entities[id];
-          if (e) slice[id] = e;
-        }
-        slice[player.id] = entities[player.id];
+        visibleIds = this._nearest(visible, entities, self, player.id);
         if (left.length) removed = [...new Set([...removed, ...left])];
+      }
+      // Only what changed since this player last heard about it.
+      const slice = { world: global };
+      const seen = new Set();
+      for (const id of visibleIds) {
+        seen.add(id);
+        const diff = diffEntity(player.sent.get(id), entities[id]);
+        if (diff) slice[id] = diff;
+        player.sent.set(id, entities[id]);
+      }
+      // Entities that fell out of the capped set count as removed for them.
+      for (const id of player.sent.keys()) {
+        if (!seen.has(id)) { player.sent.delete(id); if (!removed.includes(id)) removed.push(id); }
       }
       sendFrame(player.ws, 'state_snapshot', {
         seq: this.seq,
@@ -2945,6 +3632,7 @@ class WorldRoom {
         events: [],
         you: player.id,
         ack: self ? self.lastSeq : 0,
+        me: self ? this.sim.projectSelf(player.id) : null,
       });
       if (events.length) {
         const mine = events.filter(ev => this._eventVisible(ev, self));
@@ -2954,6 +3642,19 @@ class WorldRoom {
         }
       }
     }
+  }
+
+  /** The observer itself plus the nearest visible entities, capped at maxEntities. */
+  _nearest(visible, entities, self, selfId) {
+    const ids = [];
+    for (const id of visible) if (entities[id] && id !== selfId) ids.push(id);
+    if (ids.length > this.maxEntities - 1) {
+      const d = (id) => { const e = entities[id]; const dx = e.x - self.x; const dz = e.y - self.z; return dx * dx + dz * dz; };
+      ids.sort((a, b) => d(a) - d(b));
+      ids.length = this.maxEntities - 1;
+    }
+    if (entities[selfId]) ids.push(selfId);
+    return ids;
   }
 
   /** Events with a position are area-of-interest filtered like entities. */
@@ -2969,12 +3670,15 @@ class WorldRoom {
   _buildKeyframe(userId) {
     const entities = this.sim.projectEntities();
     const self = this.sim.getPlayer(userId);
+    const player = this.players.get(userId);
     const slice = { world: this.sim.projectGlobal() };
+    if (player) player.sent = new Map();
     if (self) {
-      for (const id of this.grid.query(self.x, self.z, this.aoiRadius)) {
-        if (entities[id]) slice[id] = entities[id];
+      const ids = this._nearest(this.grid.query(self.x, self.z, this.aoiRadius), entities, self, userId);
+      for (const id of ids) {
+        slice[id] = entities[id];
+        if (player) player.sent.set(id, entities[id]);
       }
-      if (entities[userId]) slice[userId] = entities[userId];
     }
     return {
       seq: this.seq,
@@ -2984,11 +3688,13 @@ class WorldRoom {
       events: [],
       you: userId,
       ack: self ? self.lastSeq : 0,
+      me: self ? this.sim.projectSelf(userId) : null,
       keyframe: true,
     };
   }
 
   _broadcast(type, payload) {
+    // (players inside their reconnect grace have no socket; sendFrame skips them)
     for (const player of this.players.values()) sendFrame(player.ws, type, payload);
   }
 
@@ -2997,6 +3703,23 @@ class WorldRoom {
       if (player.id !== excludeId) sendFrame(player.ws, type, payload);
     }
   }
+}
+
+/**
+ * Fields of `next` that differ from `prev` (entities are flat objects of
+ * primitives). A new entity is sent whole; an unchanged one not at all.
+ */
+function diffEntity(prev, next) {
+  if (!next) return null;
+  if (!prev || prev.k !== next.k) return next;
+  let out = null;
+  for (const key in next) {
+    if (prev[key] !== next[key]) (out || (out = {}))[key] = next[key];
+  }
+  for (const key in prev) {
+    if (!(key in next)) (out || (out = {}))[key] = null;     // field cleared (e.g. left a vehicle)
+  }
+  return out;
 }
 
 /**
@@ -3546,8 +4269,7 @@ function raceMode(options = {}) {
     const grid = sim.world.spawns.filter(s => s.tag === 'grid');
     if (grid.length) {
       const slot = grid[sim.players.indexOf(p) % grid.length];
-      p.x = slot.x; p.y = slot.y; p.z = slot.z; p.yaw = slot.yaw || 0;
-      p.vx = 0; p.vy = 0; p.vz = 0;
+      sim.teleportPlayer(p, slot);
     }
   }
 }
@@ -3669,8 +4391,7 @@ function eliminationMode(options = {}) {
       p.lap = 0;
       const spawn = sim.world.pickSpawn(null, 'start', sim.rng);
       if (spawn) {
-        p.x = spawn.x; p.y = spawn.y; p.z = spawn.z; p.yaw = spawn.yaw || 0;
-        p.vx = 0; p.vy = 0; p.vz = 0;
+        sim.teleportPlayer(p, spawn);
         p.hp = p.maxHp;
         p.deadUntil = 0;
       }
@@ -3754,6 +4475,7 @@ function createMode(spec) {
  *     worldSpec: { generator: 'city', options: { seed: 7, blocks: 6 } },
  *     mode: { id: 'race', laps: 2 },
  *     staticDir: './client',            // serves the game client too
+ *     physics: 'rapier',                // optional: real meshes, character controller, rolling balls
  *   });
  *
  * Deploying to Railway/Fly/EC2 is then just `node server.js` with
@@ -3803,6 +4525,8 @@ async function createWorldServer(options = {}) {
     maxPlayers: options.maxPlayers ?? Number(env.MAX_PLAYERS || 200),
     seed: options.seed ?? (env.WORLD_SEED ? Number(env.WORLD_SEED) : 12345),
     staticDir: options.staticDir ?? env.STATIC_DIR ?? null,
+    graceMs: options.graceMs ?? Number(env.GRACE_MS || 15_000),
+    maxEntities: options.maxEntities ?? Number(env.MAX_ENTITIES || 96),
   };
   const log = createLogger(cfg.logLevel);
   const startedAt = Date.now();
@@ -3810,6 +4534,7 @@ async function createWorldServer(options = {}) {
   const worldSpec = options.worldSpec || { generator: 'city', options: { seed: cfg.seed } };
   const manifest = buildManifest(worldSpec);
   const modeSpec = options.mode || 'freeroam';
+  const rapier = options.rapier || (options.physics === 'rapier' ? await loadRapier() : null);
 
   const verifier = options.verifier || createVerifier({
     serviceId: cfg.serviceId,
@@ -3837,6 +4562,9 @@ async function createWorldServer(options = {}) {
         aoiRadius: cfg.aoiRadius,
         maxPlayers: cfg.maxPlayers,
         seed: cfg.seed,
+        rapier,
+        graceMs: cfg.graceMs,
+        maxEntities: cfg.maxEntities,
         log,
       });
       if (options.onRoomCreated) options.onRoomCreated(room);
@@ -3939,6 +4667,7 @@ async function createWorldServer(options = {}) {
     snapshot_hz: cfg.snapshotHz,
     solids: manifest.solids.length,
     movers: manifest.movers.length,
+    physics: rapier ? 'rapier' : 'arcade',
   });
 
   return {
@@ -3951,6 +4680,14 @@ async function createWorldServer(options = {}) {
     config: cfg,
     playerCount: totalPlayers,
   };
+}
+
+/** Load and initialise the deterministic Rapier build (optional dependency). */
+async function loadRapier() {
+  const mod = await import('@dimforge/rapier3d-deterministic-compat');
+  const R = mod.default || mod;
+  await R.init();
+  return R;
 }
 
 function notFound(res) {
@@ -4131,12 +4868,7 @@ function cityRushMode(options = {}) {
     const grid = sim.world.spawns.filter(s => s.tag === 'grid');
     if (!grid.length) return;
     const slot = grid[sim.players.indexOf(p) % grid.length];
-    sim.leaveVehicle(p, true);
-    p.x = slot.x;
-    p.y = slot.y;
-    p.z = slot.z;
-    p.yaw = slot.yaw || 0;
-    p.vx = 0; p.vy = 0; p.vz = 0;
+    sim.teleportPlayer(p, slot);
     p.hp = p.maxHp;
     p.deadUntil = 0;
   }

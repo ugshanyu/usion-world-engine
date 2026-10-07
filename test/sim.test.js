@@ -66,12 +66,32 @@ describe('simulation', () => {
     expect(entities.gun1.k).toBe('k');
   });
 
-  it('acknowledges the last input sequence so clients can reconcile', () => {
+  it('applies queued inputs one per tick and acks only what it applied', () => {
     const sim = makeSim();
     sim.addPlayer('u1', 'Ann');
-    sim.setInput('u1', { seq: 7 });
-    sim.setInput('u1', { seq: 4 });          // out of order — never goes backwards
+    sim.setInput('u1', { seq: 7, mx: 1 });
+    sim.setInput('u1', { seq: 4, mx: -1 });  // older than what is queued — ignored
+    expect(sim.projectEntities().u1.ak).toBe(0);   // nothing applied yet
+    sim.step(DT);
     expect(sim.projectEntities().u1.ak).toBe(7);
+    expect(sim.getPlayer('u1').input.mx).toBe(1);
+    sim.setInput('u1', { seq: 8 });
+    sim.setInput('u1', { seq: 9 });
+    sim.step(DT);
+    expect(sim.projectSelf('u1').ak).toBe(8);
+    sim.step(DT);
+    expect(sim.projectSelf('u1').ak).toBe(9);
+    sim.step(DT);                            // queue empty: keeps the last input, ack stays
+    expect(sim.projectSelf('u1').ak).toBe(9);
+  });
+
+  it('bounds the input queue so a fast client cannot build up latency', () => {
+    const sim = makeSim();
+    const p = sim.addPlayer('u1', 'Ann');
+    for (let seq = 1; seq <= 20; seq++) sim.setInput('u1', { seq });
+    expect(p.inputQueue.length).toBe(sim.config.maxInputQueue);
+    sim.step(DT);
+    expect(p.lastSeq).toBe(20 - sim.config.maxInputQueue + 1);
   });
 
   it('has no position on the global entity, so everyone receives it', () => {

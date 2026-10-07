@@ -38,7 +38,8 @@ const ENGINE_ENTRIES = {
 
 const bundle = await rollup({
   input: join(root, 'server.js'),
-  external: ['ws', 'jose', /^node:/],
+  // Rapier is only loaded by worlds with physics: 'rapier' (Usion City is arcade).
+  external: ['ws', 'jose', /^node:/, '@dimforge/rapier3d-deterministic-compat'],
   plugins: [{
     name: 'usion-world-engine',
     resolveId(source) {

@@ -150,7 +150,7 @@ export function createGate({ verifier, getRoom, requestJoin, log, idleFrameMs = 
     ws.on('close', () => {
       connections.delete(ws);
       if (conn.session && conn.joined) {
-        getRoom(conn.session.roomId)?.removePlayer(conn.session.userId, ws, 'disconnected');
+        getRoom(conn.session.roomId)?.disconnectPlayer(conn.session.userId, ws);
       }
     });
     ws.on('error', () => { /* 'close' follows and cleans up */ });

@@ -186,6 +186,7 @@ export function traceShot(ctx, shooterId, ox, oy, oz, dx, dy, dz, maxT) {
   const vehicles = ctx.vehicles || [];
   for (let i = 0; i < vehicles.length; i++) {
     const v = vehicles[i];
+    if (v.id === ctx.ignoreVehicle) continue;
     const t = rayVehicle(v, ox, oy, oz, dx, dy, dz, bestT);
     if (t < 0 || t >= bestT) continue;
     bestT = t;

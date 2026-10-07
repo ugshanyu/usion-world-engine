@@ -1,0 +1,11 @@
+<!doctype html><meta charset="utf-8"><title>determinism</title>
+<script type="module">
+  try {
+    const R = (await import('/node_modules/@dimforge/rapier3d-deterministic-compat/dist/rapier.mjs')).default;
+    await R.init();
+    const { runDeterminismMatch } = await import('/test/fixtures/determinism-course.js');
+    window.__result = { hash: runDeterminismMatch(R) };
+  } catch (err) {
+    window.__result = { error: String(err && err.stack || err) };
+  }
+</script>

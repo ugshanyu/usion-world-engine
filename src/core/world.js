@@ -16,6 +16,8 @@
 import { createCollisionWorld } from './collision.js';
 import { createMover, updateMovers } from './movers.js';
 import { distSq2 } from './math.js';
+import { createPhysics } from './physics.js';
+import { CHARACTER } from './character.js';
 
 export const DEFAULT_THEME = {
   sky: '#9fc7ef',
@@ -46,16 +48,27 @@ export function normalizeManifest(manifest) {
     pickups: manifest.pickups || [],
     checkpoints: manifest.checkpoints || [],
     zones: manifest.zones || [],
+    meshes: manifest.meshes || [],      // [{vertices:[x,y,z,…], indices:[…]}] — Rapier backend only
+    rollers: manifest.rollers || [],    // ball spawners — Rapier backend only
   };
   if (!m.spawns.length) throw new Error('world manifest needs at least one spawn point');
   m.movers.forEach((mv, i) => { if (!mv.id) mv.id = 'mv' + i; });
   m.pickups.forEach((pk, i) => { if (!pk.id) pk.id = 'pk' + i; });
   m.checkpoints.forEach((cp, i) => { if (!cp.id) cp.id = 'cp' + i; if (cp.order == null) cp.order = i; });
   m.zones.forEach((z, i) => { if (!z.id) z.id = 'zn' + i; });
+  m.rollers.forEach((r, i) => { if (!r.id) r.id = 'rl' + i; });
   return m;
 }
 
-export function buildWorld(manifest) {
+/**
+ * @param {object} manifest
+ * @param {object} [options]
+ * @param {object} [options.rapier]  initialised RAPIER namespace → Rapier
+ *   physics backend (real meshes, character controller, rolling balls).
+ *   Without it the world uses the arcade box/ramp backend.
+ * @param {number} [options.dt]      fixed simulation step (Rapier backend)
+ */
+export function buildWorld(manifest, options = {}) {
   const m = normalizeManifest(manifest);
   const collision = createCollisionWorld({
     solids: m.solids,
@@ -64,12 +77,18 @@ export function buildWorld(manifest) {
   });
   const movers = m.movers.map(createMover);
   updateMovers(movers, 0);
+  const moverById = new Map(movers.map(mv => [mv.id, mv]));
+  const physics = options.rapier
+    ? createPhysics(options.rapier, m, movers, { character: CHARACTER, dt: options.dt, gravity: manifest.gravity })
+    : null;
   const checkpoints = m.checkpoints.slice().sort((a, b) => a.order - b.order);
 
   return {
     manifest: m,
     collision,
     movers,
+    moverById,
+    physics,
     checkpoints,
     zones: m.zones,
     spawns: m.spawns,
@@ -77,8 +96,17 @@ export function buildWorld(manifest) {
     pickups: m.pickups,
     bounds: m.bounds,
     killY: m.killY,
-    /** Advance hazards to world time `t` (seconds). */
-    update(t) { updateMovers(movers, t); },
+    /**
+     * Advance hazards to world time `t` (seconds). Pure function of `t`, so a
+     * phone replaying history can jump back and forth freely. With physics,
+     * the new poses are visible to queries after the next physics step.
+     */
+    update(t) {
+      updateMovers(movers, t);
+      if (physics) physics.syncMovers();
+    },
+    /** Release native physics memory (Rapier backend). */
+    dispose() { if (physics) physics.free(); },
     /** Spawn point chosen to be as far as possible from the given entities. */
     pickSpawn(avoid, tag, rng) {
       const pool = tag ? m.spawns.filter(s => s.tag === tag) : m.spawns;

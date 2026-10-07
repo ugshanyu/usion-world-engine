@@ -36,16 +36,21 @@ move, jump, dive.
 
 ## Milestones
 
-### M1 — Engine groundwork (universe plan Phase 1 + the parts of Phase 2 this game needs)
-- [ ] Fixed-step simulation on server and client
-- [ ] Input queue + acks; prediction that replays unacked inputs (own player only)
-- [ ] 15 s disconnect grace; smaller snapshots (changed fields, per-observer cap)
-- [ ] Rapier core behind the sim API, with the spike's sandbox shims
-- [ ] Player on Rapier's character controller: run, jump (coyote time + jump
-      buffer), dive, stumble/knock-back, get-up, fall → respawn at checkpoint
-- [ ] Player-vs-player shoving
-- [ ] Tests: determinism (Node vs WebKit vs Chromium hash), prediction replay,
-      knock-back from each obstacle type
+### M1 — Engine groundwork ✅ (branch `bean-rush/m1`)
+- [x] Fixed-step simulation on server and client
+- [x] Input queue + acks; prediction that replays unacked inputs (own player only)
+- [x] 15 s disconnect grace; smaller snapshots (changed fields, per-observer cap)
+- [x] Rapier core behind the sim API (`physics: 'rapier'`); arcade backend unchanged
+- [x] Player on Rapier's character controller: run, jump (coyote time + jump
+      buffer), dive, stumble/knock-back, get-up, fall → respawn
+- [x] Player-vs-player shoving (through the controller, never into walls)
+- [x] Tests: determinism (Node ARM/x86, Chromium, WebKit: same hash for an
+      8-player match), prediction replay (< 1 µm at 100/250 ms), knock-back
+      from spinner, sweeper and rolling ball, platform riding, mesh floors
+- Moved on: respawn at the last *checkpoint* is a Bean Rush mode rule → M2;
+  the rooms-runtime sandbox shims → universe plan Phase 3 (hosted mode)
+- Also fixed (universe plan Phase 1): mode `config` was never applied, seat
+  numbering, shooting your own vehicle, race/elimination teleports while seated
 
 ### M2 — The level, playable alone with bots
 - [ ] Course built from engine pieces: start platform, spinning-bar field,

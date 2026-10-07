@@ -115,8 +115,7 @@ export function eliminationMode(options = {}) {
       p.lap = 0;
       const spawn = sim.world.pickSpawn(null, 'start', sim.rng);
       if (spawn) {
-        p.x = spawn.x; p.y = spawn.y; p.z = spawn.z; p.yaw = spawn.yaw || 0;
-        p.vx = 0; p.vy = 0; p.vz = 0;
+        sim.teleportPlayer(p, spawn);
         p.hp = p.maxHp;
         p.deadUntil = 0;
       }
