@@ -1,0 +1,2 @@
+{ "name": "rapier-spike", "private": true, "type": "module",
+  "dependencies": { "@dimforge/rapier3d-deterministic-compat": "0.21.0" } }

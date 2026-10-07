@@ -1,0 +1,1 @@
+{"name":"ivm-spike","private":true,"type":"module","dependencies":{"isolated-vm":"^6.2.0"}}

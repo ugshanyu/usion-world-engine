@@ -1,0 +1,13 @@
+import R from '@dimforge/rapier3d-deterministic-compat';
+import { PROFILES, buildWorld, step } from './scene.mjs';
+await R.init();
+const s = buildWorld(R, PROFILES.det);
+const pos = (b) => { const t = b.translation(); return [t.x, t.y, t.z]; };
+const c0 = s.chars.map((c) => pos(c.body)), v0 = s.cars.map((c) => pos(c.body)), b0 = s.boxes.map(pos);
+for (let t = 0; t < 600; t++) step(s, t);
+const d = (a, b) => Math.hypot(a[0]-b[0], a[2]-b[2]);
+const mean = (xs) => (xs.reduce((a, b) => a + b, 0) / xs.length).toFixed(1);
+console.log('chars moved m (mean):', mean(s.chars.map((c, i) => d(pos(c.body), c0[i]))), ' minY:', Math.min(...s.chars.map(c => pos(c.body)[1])).toFixed(1));
+console.log('cars moved m (mean):', mean(s.cars.map((c, i) => d(pos(c.body), v0[i]))), ' speeds:', s.cars.map(c => c.ctrl.currentVehicleSpeed().toFixed(1)).join(' '), ' minY:', Math.min(...s.cars.map(c => pos(c.body)[1])).toFixed(1));
+console.log('boxes moved m (mean):', mean(s.boxes.map((b, i) => d(pos(b), b0[i]))), ' minY:', Math.min(...s.boxes.map(b => pos(b)[1])).toFixed(1));
+const grounded = s.chars.filter(c => c.grounded).length; console.log('chars grounded:', grounded, '/', s.chars.length);

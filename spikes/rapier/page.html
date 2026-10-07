@@ -1,0 +1,11 @@
+<!doctype html><meta charset="utf-8"><title>rapier spike</title>
+<script type="module">
+  const t0 = performance.now();
+  const R = (await import('./node_modules/@dimforge/rapier3d-deterministic-compat/dist/rapier.mjs')).default;
+  await R.init();
+  const initMs = performance.now() - t0;
+  const { run } = await import('./scene.mjs');
+  window.__runSpike = (profile, ticks) => run(R, profile, ticks, () => performance.now());
+  window.__initMs = initMs;
+  window.__ready = true;
+</script>
